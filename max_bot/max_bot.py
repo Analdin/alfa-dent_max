@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/")
-MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "").strip()
+MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx").strip()
 MAX_MINIAPP_LINK = os.getenv("MAX_MINIAPP_LINK", "https://alfadent-miniapp.onrender.com/miniapp.html").strip()
 _MAX_BOT_USERNAME_RAW = os.getenv("MAX_BOT_USERNAME", "").strip().lstrip("@")
 MAX_BOT_USERNAME = "" if _MAX_BOT_USERNAME_RAW.startswith("PASTE_") else _MAX_BOT_USERNAME_RAW
