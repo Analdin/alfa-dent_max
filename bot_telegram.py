@@ -27,6 +27,9 @@ from telegram.ext import (
     MessageHandler, filters,
 )
 
+# ========== БИТРИКС24 ==========
+BITRIX24_WEBHOOK = "https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/"
+
 # ---------------- CONFIGURATION ----------------
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PASTE_NEW_TELEGRAM_BOT_TOKEN_HERE").strip()
