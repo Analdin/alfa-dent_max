@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MAX webhook bot for AlfaDent. Uses the existing Mini App URL and Bitrix24 CRM.
+"""MAX webhook bot for AlfaDent using the existing Mini App and Bitrix24 CRM.
 
-The bot does not claim a visit is booked: without the MIS API, it submits a request
-for the administrator to confirm. Secrets are read from environment variables/.env.
+Configuration remains hard-coded as requested. Without MIS API access, the bot creates
+requests for administrator confirmation and never claims a visit is already booked.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from datetime import datetime, date, timedelta
@@ -17,44 +16,34 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 
-MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/")
-MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx").strip()
-MAX_MINIAPP_LINK = os.getenv("MAX_MINIAPP_LINK", "https://alfadent-miniapp.onrender.com/miniapp.html").strip()
-_MAX_BOT_USERNAME_RAW = os.getenv("MAX_BOT_USERNAME", "").strip().lstrip("@")
-MAX_BOT_USERNAME = "" if _MAX_BOT_USERNAME_RAW.startswith("PASTE_") else _MAX_BOT_USERNAME_RAW
-MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
-_BITRIX24_WEBHOOK_RAW = os.getenv("BITRIX24_WEBHOOK", "").strip().rstrip("/")
-BITRIX24_WEBHOOK = "" if _BITRIX24_WEBHOOK_RAW.startswith("PASTE_NEW_") else _BITRIX24_WEBHOOK_RAW
-BITRIX_ASSIGNED_BY_ID = int(os.getenv("BITRIX_ASSIGNED_BY_ID", "33"))
-BITRIX_ADMIN_IDS = [int(x.strip()) for x in os.getenv("BITRIX_ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-MAX_ADMIN_TO_BITRIX: dict[int, int] = {}
-for _pair in os.getenv("MAX_ADMIN_TO_BITRIX", "").split(","):
-    if ":" in _pair:
-        try:
-            _max_id, _b24_id = _pair.split(":", 1)
-            MAX_ADMIN_TO_BITRIX[int(_max_id.strip())] = int(_b24_id.strip())
-        except ValueError:
-            pass
-ADMIN_IDS = sorted(set(BITRIX_ADMIN_IDS + list(MAX_ADMIN_TO_BITRIX.values())))
-OTP_CODE = os.getenv("DEMO_OTP_CODE", "1234").strip() or "1234"
-CLINIC_PHONE = os.getenv("CLINIC_PHONE", "+7 (988) 233-77-25")
-CLINIC_ADDRESS = os.getenv("CLINIC_ADDRESS", "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Вход с торца здания, рядом с магазином «Коляски».")
-CLINIC_HOURS = os.getenv("CLINIC_HOURS", "Ежедневно, 09:00–20:00")
-YANDEX_MAPS_URL = os.getenv("YANDEX_MAPS_URL", "https://yandex.ru/medicine/clinic/alfa_dent_1617563656")
-PROMOTIONS_URL = os.getenv("PROMOTIONS_URL", "https://alfadent-miniapp.onrender.com/assets/promotions.json").strip()
+# Настройки сохранены в коде по согласованию с владельцем проекта; .env не используется.
+MAX_API_BASE = "https://platform-api2.max.ru"
+MAX_API = MAX_API_BASE  # алиас прежнего имени настройки
+TOKEN = 'f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx'
+MAX_BOT_TOKEN = TOKEN  # алиас для текущей версии обработчиков
+BITRIX24_WEBHOOK = 'https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/'.rstrip("/")
+BITRIX_ASSIGNED_BY_ID = 33
+ADMIN_IDS = [15, 33, 35, 37, 39, 727, 7821]
+OTP_CODE = "1234"  # временный код; реальная SMS-отправка не подключена
+MAX_MINIAPP_LINK = "https://alfadent-miniapp.onrender.com/miniapp.html"
+MAX_BOT_USERNAME = ""  # публичный username не был предоставлен; не выдумываем
+MAX_WEBHOOK_SECRET = ""  # не проверяется, пока секрет webhook не согласован в MAX
+CLINIC_PHONE = "+7 (988) 233-77-25"
+CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски»."
+CLINIC_HOURS = "Ежедневно, 09:00–20:00"
+YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
+PROMOTIONS_URL = "https://alfadent-miniapp.onrender.com/assets/promotions.json"
 PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
-DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_FILE = DATA_DIR / "pending_requests.json"
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(DATA_DIR / "max_bot.log", encoding="utf-8")],
 )
@@ -64,6 +53,12 @@ app = Flask(__name__)
 SERVICES = [
     "Консультация", "ПРОФ гигиена", "Лечение кариеса", "Удаление зуба", "Имплантация",
     "Протезирование", "Ортодонтия (брекеты, элайнеры)", "Гнатология / ВНЧС", "Диагностика (КЛКТ)",
+]
+SERVICE_CATEGORIES = [
+    "Консультация стоматолога", "КЛКТ-диагностика", "Лечение зубов",
+    "Профессиональная гигиена", "Хирургия", "Имплантация", "Протезирование",
+    "Виниры", "Гнатология", "Ортодонтия", "Детская стоматология",
+    "Лечение во сне и седации",
 ]
 PROBLEMS = ["Болит зуб", "Отёк, воспаление", "Скол зуба", "Выпала коронка", "Ребёнку нужна помощь", "Не знаю, что нужно"]
 EMERGENCY_PROBLEMS = ["Острая боль", "Отёк", "Скол зуба", "Выпала коронка", "Ребёнку больно", "Нужен срочный звонок"]
@@ -185,20 +180,21 @@ def create_lead(title: str, user_id: int, description: str, phone: str = "") -> 
 
 
 def create_task_for_active_admins(title: str, description: str, priority: int = 2) -> dict[str, Any]:
-    active = get_active_shift_users()
-    if not active:
-        return {"error": "Нет администраторов на активной смене"}
-    for max_admin_id in active:
-        b24_id = MAX_ADMIN_TO_BITRIX.get(max_admin_id)
-        if not b24_id:
-            continue
+    """Создаёт задачи для администраторов, которые начали смену в MAX-боте."""
+    active_admins = get_active_shift_users()
+    if not active_admins:
+        logger.warning("Нет активных администраторов на смене")
+        return {"error": "Нет администраторов на смене"}
+    results = []
+    for admin_id in active_admins:
         result = bitrix_call("tasks.task.add", {"fields": {
-            "TITLE": title[:255], "DESCRIPTION": description, "RESPONSIBLE_ID": b24_id, "PRIORITY": priority,
+            "TITLE": title[:255], "DESCRIPTION": description,
+            "RESPONSIBLE_ID": admin_id, "PRIORITY": priority,
         }})
+        results.append(result)
         if result.get("result", {}).get("task", {}).get("id"):
             return result
-    return {"error": "Не удалось создать задачу для администраторов на смене"}
-
+    return results[0] if results else {"error": "Ошибка создания задач"}
 
 def create_support_request(user_id: int, subject: str, description: str, phone: str = "", priority: int = 2) -> dict[str, Any]:
     user = session_for(user_id)
@@ -253,10 +249,10 @@ def link_button(text: str, url: str) -> dict[str, Any]:
 
 
 def app_button(text: str = "📱 Открыть приложение клиники") -> Optional[dict[str, Any]]:
-    # Use MAX's native open_app button; a plain HTTPS link may open outside the Mini App
-    # context and then the API cannot validate window.WebApp.initData.
-    if MAX_BOT_USERNAME:
-        return {"type": "open_app", "text": text[:64], "web_app": MAX_BOT_USERNAME}
+    # Используем существующий Mini App на Render. URL должен быть также привязан
+    # к этому боту в MAX Partner Portal: Чат-боты → Настройки → URL Mini App.
+    if MAX_MINIAPP_LINK.startswith("https://"):
+        return {"type": "open_app", "text": text[:64], "web_app": MAX_MINIAPP_LINK}
     return None
 
 
@@ -332,8 +328,47 @@ def dispatch_after_auth(user_id: int) -> None:
             doctor = ""
         user["appointment"] = {"service": "", "problem": "", "doctor": doctor, "date": "", "time": "", "promotion": ""}
         show_services(user_id, appointment_flow=True)
+    elif action and action.startswith("service_category:"):
+        try:
+            index = int(action.split(":", 1)[1])
+            category = SERVICE_CATEGORIES[index]
+        except (ValueError, IndexError):
+            send_main_menu(user_id)
+            return
+        user["appointment"] = {"service": category, "problem": "", "doctor": "Подберёт администратор", "date": "", "time": "", "promotion": ""}
+        show_booking_dates(user_id)
     else:
         send_main_menu(user_id)
+
+
+def find_client_in_bitrix(phone: str) -> dict[str, Any]:
+    """Ищет клиента в Bitrix24 по номеру телефона; возвращает пустой результат при ошибке."""
+    phone_clean = re.sub(r"\D", "", phone or "")
+    if len(phone_clean) == 11 and phone_clean[0] in "78":
+        phone_clean = phone_clean[1:]
+    if not phone_clean:
+        return {"found": False}
+    result = bitrix_call("crm.item.list", {
+        "entityTypeId": 1,
+        "filter": {"%PHONE": phone_clean},
+        "select": ["id", "title", "name", "assignedById"],
+    })
+    items = result.get("result", {}).get("items", []) if isinstance(result, dict) else []
+    if items:
+        item = items[0]
+        return {"found": True, "type": "LEAD", "id": item.get("id"),
+                "name": item.get("name") or item.get("title") or "Клиент"}
+    result = bitrix_call("crm.item.list", {
+        "entityTypeId": 3,
+        "filter": {"%PHONE": phone_clean},
+        "select": ["id", "name", "lastName", "assignedById"],
+    })
+    items = result.get("result", {}).get("items", []) if isinstance(result, dict) else []
+    if items:
+        item = items[0]
+        full_name = f"{item.get('name', '')} {item.get('lastName', '')}".strip()
+        return {"found": True, "type": "CONTACT", "id": item.get("id"), "name": full_name or "Клиент"}
+    return {"found": False}
 
 
 def process_phone(user_id: int, text: str) -> None:
@@ -343,9 +378,13 @@ def process_phone(user_id: int, text: str) -> None:
         return
     user = session_for(user_id)
     user["phone"] = "+7" + phone
+    client = find_client_in_bitrix(user["phone"])
+    if client.get("found"):
+        user["bitrix_id"] = client.get("id")
+        user["bitrix_type"] = client.get("type")
+        user["name"] = client.get("name") or user.get("name") or "Пациент"
     user["step"] = "waiting_code"
-    send_message(user_id, f"Номер принят. SMS сейчас не отправляется, поскольку провайдер не подключён.\n\nВведите временный код: {OTP_CODE}")
-
+    send_message(user_id, f"Номер принят. SMS фактически не отправляется: SMS-провайдер не подключён.\n\nВведите временный код: {OTP_CODE}")
 
 def process_code(user_id: int, text: str) -> None:
     user = session_for(user_id)
@@ -367,18 +406,36 @@ def show_my_visits(user_id: int) -> None:
 
 
 def show_services(user_id: int, appointment_flow: bool = False) -> None:
-    rows = [[callback(service, f"book_service_{i}" if appointment_flow else f"service_info_{i}")] for i, service in enumerate(SERVICES)]
-    if not appointment_flow:
-        b = app_button("Открыть каталог в Mini App")
+    if appointment_flow:
+        rows = [[callback(service, f"book_service_{i}")] for i, service in enumerate(SERVICES)]
+        rows.append([callback("Не уверен(а) в услуге — подберите на консультации", "book_service_unknown")])
+        rows.append([callback("⬅️ Главное меню", "back_to_menu")])
+        note = "🦷 Запись на приём\n\nВыберите одну из 9 согласованных услуг. Дату и время можно указать как пожелание — фактическое свободное окно подтвердит администратор, поскольку МИС «Инфоклиника» не подключена."
+    else:
+        rows = [[callback(category, f"service_category_{i}")] for i, category in enumerate(SERVICE_CATEGORIES)]
+        b = app_button("📱 Полный каталог и цены в Mini App")
         if b:
             rows.append([b])
-        rows.append([callback("🦷 Оставить заявку", "appointment")])
-    else:
-        rows.append([callback("Не уверен(а) в услуге — подберите на консультации", "book_service_unknown")])
-    rows.append([callback("⬅️ Главное меню", "back_to_menu")])
-    note = "Выберите услугу для заявки. Точный состав и стоимость подтвердит администратор." if appointment_flow else "📋 Услуги и цены\n\nОсновной список из клиентского ТЗ. Цены в чате не выдумываем: уточняйте стоимость по актуальному прайс-листу или откройте Mini App."
+        rows.append([callback("🦷 Записаться", "appointment")])
+        rows.append([callback("⬅️ Главное меню", "back_to_menu")])
+        note = "📋 Услуги и цены\n\nВыберите направление. Подробные карточки с составом, показаниями, длительностью, актуальной ценой и врачами доступны в существующем Mini App. В чате не публикуем неподтверждённые цены и соответствия врачей."
     send_message(user_id, note, rows)
 
+
+def show_service_category_detail(user_id: int, index: int) -> None:
+    if not 0 <= index < len(SERVICE_CATEGORIES):
+        send_message(user_id, "Направление не найдено.", [[callback("⬅️ К услугам", "services")]])
+        return
+    category = SERVICE_CATEGORIES[index]
+    rows = []
+    b = app_button("📱 Открыть карточки в Mini App")
+    if b:
+        rows.append([b])
+    rows.extend([
+        [callback("🦷 Оставить заявку по направлению", f"service_category_book_{index}")],
+        [callback("⬅️ К услугам и ценам", "services")],
+    ])
+    send_message(user_id, f"📋 {category}\n\nПолный состав услуги, длительность, актуальную стоимость и подходящих специалистов смотрите в Mini App. Для записи можно оставить заявку; администратор уточнит детали и подберёт врача.", rows)
 
 def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) -> None:
     pages = max(1, (len(DOCTORS) + DOCTORS_PER_PAGE - 1) // DOCTORS_PER_PAGE)
@@ -464,13 +521,14 @@ def start_booking(user_id: int, promo: Optional[dict[str, Any]] = None) -> None:
 def show_doctor_choice_for_booking(user_id: int) -> None:
     user = session_for(user_id)
     a = user.setdefault("appointment", {})
-    txt = (f"🎁 Акция: {a.get('promotion')}\nУслуга: {a.get('service') or 'уточнить'}\n\n"
-           "Связь с врачом не подтверждена. Вы можете оставить пожелание по врачу или поручить подбор администратору.")
-    rows = [[callback("Пусть администрация подберёт врача", "book_doctor_unknown")],
-            [callback("Выбрать врача как пожелание", "book_choose_doctor")],
-            [callback("⬅️ К услугам", "book_change_service")]]
-    send_message(user_id, txt, rows)
-
+    # If the patient started from an individual doctor's page, preserve that as a preference.
+    if a.get("doctor") and a.get("doctor") != "Подберёт администратор":
+        send_message(user_id, f"Врач как пожелание: {a.get('doctor')}. Администратор подтвердит, оказывает ли специалист выбранную услугу.", [[callback("➡️ Выбрать желаемую дату", "book_keep_doctor_preference")], [callback("Изменить услугу", "book_change_service")]])
+        return
+    txt = (f"Услуга: {a.get('service') or 'уточнить'}\n\n"
+           "Связка «услуга → врач» из МИС не предоставлена. Чтобы не показывать неподходящих специалистов, врач будет подобран администратором."
+           " Вы можете указать пожелание по дате и времени; свободные окна будут подтверждены отдельно.")
+    send_message(user_id, txt, [[callback("Пусть администрация подберёт врача", "book_doctor_unknown")], [callback("⬅️ К услугам", "book_change_service")]])
 
 def submit_booking(user_id: int) -> None:
     user = session_for(user_id)
@@ -560,14 +618,14 @@ def handle_text(user_id: int, text: str) -> None:
         send_main_menu(user_id)
         return
     if text == "/shift_start":
-        if user_id not in MAX_ADMIN_TO_BITRIX:
-            send_message(user_id, "Команда доступна только администраторам с настроенным соответствием MAX ID → Bitrix24 ID.")
+        if user_id not in ADMIN_IDS:
+            send_message(user_id, "Команда доступна только администраторам.")
             return
         end = start_shift(user_id)
         send_message(user_id, f"Смена начата до {end:%H:%M}. Активных администраторов: {len(get_active_shift_users())}.")
         return
     if text == "/shift_end":
-        if user_id not in MAX_ADMIN_TO_BITRIX:
+        if user_id not in ADMIN_IDS:
             send_message(user_id, "Команда доступна только администраторам.")
             return
         send_message(user_id, "Смена завершена." if end_shift(user_id) else "У вас нет активной смены.")
@@ -638,6 +696,23 @@ def dispatch_callback(user_id: int, data: str) -> None:
         send_message(user_id, f"Вы выбрали: {problem}.\n\nОпишите, что произошло. При сильной боли, отёке или резком ухудшении состояния не ждите ответа в чате.")
     elif data == "services":
         show_services(user_id)
+    elif data.startswith("service_category_book_"):
+        try:
+            index = int(data.rsplit("_", 1)[1])
+            category = SERVICE_CATEGORIES[index]
+        except (ValueError, IndexError):
+            send_message(user_id, "Направление не найдено.", [[callback("⬅️ К услугам", "services")]])
+            return
+        if not require_auth(user_id, f"service_category:{index}"):
+            return
+        user["appointment"] = {"service": category, "problem": "", "doctor": "Подберёт администратор", "date": "", "time": "", "promotion": ""}
+        show_booking_dates(user_id)
+    elif data.startswith("service_category_"):
+        try:
+            index = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            index = -1
+        show_service_category_detail(user_id, index)
     elif data.startswith("service_info_"):
         try: service = SERVICES[int(data.rsplit("_", 1)[1])]
         except (ValueError, IndexError): service = "Услуга"
@@ -667,17 +742,24 @@ def dispatch_callback(user_id: int, data: str) -> None:
         start_promotion_booking(user_id, data.rsplit("_", 1)[1])
     elif data == "about":
         text = ("🏥 О клинике «Альфа-Дент»\n\nКлиника работает с 2011 года.\n\n"
-                f"Адрес: {CLINIC_ADDRESS}\nГрафик: {CLINIC_HOURS}\nТелефон / WhatsApp: {CLINIC_PHONE}\n\n"
-                "Преимущества: комплексный подход, цифровые технологии, лечение под микроскопом, КЛКТ-диагностика, имплантация и сложные случаи, лечение во сне и седация.")
-        send_message(user_id, text, [[link_button("🌐 Сайт клиники", "https://alfadentstom.ru/")], [link_button("📍 Яндекс Карты", YANDEX_MAPS_URL)], [callback("🦷 Записаться", "appointment")], [callback("⬅️ Главное меню", "back_to_menu")]])
+                f"Адрес: {CLINIC_ADDRESS}\nГрафик: {CLINIC_HOURS}\nТелефон / WhatsApp: {CLINIC_PHONE}\n"
+                "Парковка: городская платная. Оплата: наличными и безналичным способом.\n\n"
+                "Преимущества: комплексный подход, цифровые технологии, лечение под микроскопом, КЛКТ-диагностика, имплантация и сложные случаи, лечение во сне и седация.\n\n"
+                "Видео о клинике и полные сведения доступны в приложении клиники.")
+        app = app_button("📱 Видео и подробности в Mini App")
+        rows = [[link_button("🌐 Сайт клиники", "https://alfadentstom.ru/")], [link_button("📍 Яндекс Карты", YANDEX_MAPS_URL)]]
+        if app:
+            rows.append([app])
+        rows.extend([[callback("🦷 Записаться", "appointment")], [callback("⬅️ Главное меню", "back_to_menu")]])
+        send_message(user_id, text, rows)
     elif data == "reviews":
         rows = [[link_button("⭐ Яндекс Карты", YANDEX_MAPS_URL)], [link_button("⭐ ПроДокторов", "https://prodoctorov.ru/sochi/alfadent/")], [link_button("⭐ 2ГИС", "https://2gis.ru/sochi/firm/alfadent/reviews")], [callback("⬅️ Главное меню", "back_to_menu")]]
         send_message(user_id, "⭐ Отзывы\n\nПроверьте актуальность страниц перед публикацией.", rows)
     elif data == "referral":
-        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else "https://alfadentstom.ru/"
+        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else MAX_MINIAPP_LINK
         send_message(user_id, f"💛 Рекомендовать клинику\n\nПоделитесь ссылкой с друзьями. Условия бонусов не обещаем без согласования.\n\n{link}", [[link_button("📤 Поделиться ссылкой", link)], [callback("📋 Показать ссылку", "referral_show")], [callback("⬅️ Главное меню", "back_to_menu")]])
     elif data == "referral_show":
-        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else "https://alfadentstom.ru/"
+        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else MAX_MINIAPP_LINK
         send_message(user_id, link, [[callback("⬅️ Главное меню", "back_to_menu")]])
     elif data == "support":
         begin_support(user_id)
@@ -700,6 +782,8 @@ def dispatch_callback(user_id: int, data: str) -> None:
     elif data.startswith("book_doctor_") and data != "book_doctor_unknown":
         try: idx = int(data.rsplit("_", 1)[1]); a["doctor"] = DOCTORS[idx]
         except (ValueError, IndexError): a["doctor"] = ""
+        show_booking_dates(user_id)
+    elif data == "book_keep_doctor_preference":
         show_booking_dates(user_id)
     elif data == "book_doctor_unknown":
         a["doctor"] = "Подберёт администратор"
@@ -800,8 +884,9 @@ def main() -> None:
     if not MAX_MINIAPP_LINK.startswith("https://"):
         logger.warning("MAX_MINIAPP_LINK должен быть публичным HTTPS URL.")
     if not MAX_BOT_USERNAME:
-        logger.warning("MAX_BOT_USERNAME не настроен: inline open_app кнопки скрыты. Привяжите URL Mini App в MAX Partner Portal и укажите публичное имя текущего бота.")
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+        logger.info("Публичное имя MAX-бота не задано: кнопка рекомендаций использует прямой URL Mini App.")
+    logger.info("Кнопка Mini App направлена на %s; URL также должен быть привязан в MAX Partner Portal.", MAX_MINIAPP_LINK)
+    app.run(host="0.0.0.0", port=5000, debug=False)
 
 
 if __name__ == "__main__":
