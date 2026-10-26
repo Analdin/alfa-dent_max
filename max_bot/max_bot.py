@@ -252,7 +252,7 @@ def app_button(text: str = "📱 Открыть приложение клини�
     # Используем существующий Mini App на Render. URL должен быть также привязан
     # к этому боту в MAX Partner Portal: Чат-боты → Настройки → URL Mini App.
     if MAX_MINIAPP_LINK.startswith("https://"):
-        return {"type": "open_app", "text": text[:64], "web_app": MAX_MINIAPP_LINK}
+        return {"type": "link", "text": text[:64], "url": MAX_MINIAPP_LINK}
     return None
 
 
