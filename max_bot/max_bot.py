@@ -1,54 +1,226 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""MAX webhook bot for AlfaDent using the existing Mini App and Bitrix24 CRM.
+"""MAX webhook bot for AlfaDent, integrated with the existing Mini App and Bitrix24 CRM.
 
-Configuration remains hard-coded as requested. Without MIS API access, the bot creates
-requests for administrator confirmation and never claims a visit is already booked.
+Secrets are read from environment variables or a private env file. Without MIS API access,
+the bot creates requests for administrator confirmation and never claims a visit is booked.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
+import os
 import re
+import shlex
+import sqlite3
+import threading
 import time
-from datetime import datetime, date, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from flask import Flask, jsonify, request
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Настройки сохранены в коде по согласованию с владельцем проекта; .env не используется.
-MAX_API_BASE = "https://platform-api2.max.ru"
-MAX_API = MAX_API_BASE  # алиас прежнего имени настройки
-TOKEN = 'f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx'
-MAX_BOT_TOKEN = TOKEN  # алиас для текущей версии обработчиков
-BITRIX24_WEBHOOK = 'https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/'.rstrip("/")
-BITRIX_ASSIGNED_BY_ID = 33
-ADMIN_IDS = [15, 33, 35, 37, 39, 727, 7821]
-OTP_CODE = "1234"  # временный код; реальная SMS-отправка не подключена
-MAX_MINIAPP_LINK = "https://alfadent-miniapp.onrender.com/miniapp.html"
-MAX_BOT_USERNAME = ""  # публичный username не был предоставлен; не выдумываем
-MAX_WEBHOOK_SECRET = ""  # не проверяется, пока секрет webhook не согласован в MAX
-CLINIC_PHONE = "+7 (988) 233-77-25"
-CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски»."
-CLINIC_HOURS = "Ежедневно, 09:00–20:00"
-YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
-PROMOTIONS_URL = "https://alfadent-miniapp.onrender.com/assets/promotions.json"
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE settings without overriding systemd environment values."""
+    if not path.is_file():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            raw_value = raw_value.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
+            if raw_value.startswith(("'", '"')):
+                try:
+                    parsed = shlex.split(raw_value, comments=False, posix=True)
+                    value = parsed[0] if parsed else ""
+                except ValueError:
+                    value = raw_value.strip("'\"")
+            else:
+                value = raw_value.split(" #", 1)[0].strip()
+            os.environ.setdefault(key, value)
+    except OSError as exc:
+        print(f"[WARN] Не удалось прочитать файл окружения {path}: {type(exc).__name__}")
+
+
+load_env_file(Path(os.getenv("MAX_BOT_ENV_FILE", str(BASE_DIR / ".env"))))
+
+
+def parse_int_list(value: str) -> list[int]:
+    result: list[int] = []
+    for item in (value or "").split(","):
+        item = item.strip()
+        if item.isdigit():
+            number = int(item)
+            if number > 0 and number not in result:
+                result.append(number)
+    return result
+
+
+def parse_admin_map(value: str) -> dict[int, int]:
+    """Parse MAX_USER_ID:BITRIX_USER_ID pairs, e.g. 123:45,456:78."""
+    result: dict[int, int] = {}
+    for item in (value or "").split(","):
+        if ":" not in item:
+            continue
+        left, right = item.split(":", 1)
+        if left.strip().isdigit() and right.strip().isdigit():
+            max_id = int(left.strip())
+            bitrix_id = int(right.strip())
+            if max_id > 0 and bitrix_id > 0:
+                result[max_id] = bitrix_id
+    return result
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logging.getLogger("alfadent_max_bot").warning("Переменная %s должна быть целым числом; используется значение по умолчанию.", name)
+        return default
+
+
+MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").strip().rstrip("/")
+MAX_API = MAX_API_BASE
+TOKEN = os.getenv("MAX_BOT_TOKEN", "")
+MAX_BOT_TOKEN = TOKEN.strip()
+BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK", "").strip().rstrip("/")
+BITRIX_ASSIGNED_BY_ID = env_int("BITRIX_ASSIGNED_BY_ID", 33)
+BITRIX_OBSERVER_IDS = parse_int_list(os.getenv("BITRIX_OBSERVER_IDS", ""))
+MAX_ADMIN_IDS = parse_int_list(os.getenv("MAX_ADMIN_IDS", "15,33,35,37,39,727,7821"))
+ADMIN_IDS = MAX_ADMIN_IDS  # compatibility alias; these are MAX user IDs, not Bitrix IDs.
+MAX_TO_BITRIX_ADMIN_MAP = parse_admin_map(os.getenv("MAX_TO_BITRIX_ADMIN_MAP", ""))
+
+OTP_CODE = "1234"  # Временный демонстрационный код; реальная SMS-отправка не подключена.
+MAX_MINIAPP_LINK = os.getenv("MAX_MINIAPP_LINK", "https://alfadent-miniapp.onrender.com/miniapp.html").strip()
+MAX_BOT_USERNAME = os.getenv("MAX_BOT_USERNAME", "").strip()
+MAX_BOT_CONTACT_ID_RAW = os.getenv("MAX_BOT_CONTACT_ID", "").strip()
+MAX_BOT_CONTACT_ID_VALUE = int(MAX_BOT_CONTACT_ID_RAW) if MAX_BOT_CONTACT_ID_RAW.isdigit() else 0
+MAX_BOT_CONTACT_ID = MAX_BOT_CONTACT_ID_VALUE if MAX_BOT_CONTACT_ID_VALUE > 0 else None
+MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")
+MAX_REQUIRE_WEBHOOK_SECRET = os.getenv("MAX_REQUIRE_WEBHOOK_SECRET", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+CLINIC_PHONE = os.getenv("CLINIC_PHONE", "+7 (988) 233-77-25")
+CLINIC_ADDRESS = os.getenv("CLINIC_ADDRESS", "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски».")
+CLINIC_HOURS = os.getenv("CLINIC_HOURS", "Ежедневно, 09:00–20:00")
+YANDEX_MAPS_URL = os.getenv("YANDEX_MAPS_URL", "https://yandex.ru/medicine/clinic/alfa_dent_1617563656")
+PROMOTIONS_URL = os.getenv("PROMOTIONS_URL", "https://alfadent-miniapp.onrender.com/assets/promotions.json").strip()
 PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
+CLINIC_TIMEZONE_NAME = os.getenv("CLINIC_TIMEZONE", "Europe/Moscow")
+try:
+    CLINIC_TZ = ZoneInfo(CLINIC_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    CLINIC_TZ = ZoneInfo("Europe/Moscow")
+    CLINIC_TIMEZONE_NAME = "Europe/Moscow"
+
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-PENDING_FILE = DATA_DIR / "pending_requests.json"
+if os.name == "posix":
+    try:
+        DATA_DIR.chmod(0o700)
+    except OSError:
+        pass
+PENDING_FILE = DATA_DIR / "pending_requests.json"  # legacy-compatible emergency queue
+DATABASE_FILE = DATA_DIR / "max_bot.sqlite3"
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_file_handler = RotatingFileHandler(DATA_DIR / "max_bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(DATA_DIR / "max_bot.log", encoding="utf-8")],
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 logger = logging.getLogger("alfadent_max_bot")
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+
+DB_LOCK = threading.RLock()
+SESSION_LOCK = threading.RLock()
+PENDING_LOCK = threading.RLock()
+WEBHOOK_QUEUE_WAKE = threading.Event()
+WEBHOOK_WORKER_STOP = threading.Event()
+WEBHOOK_WORKER_THREAD: Optional[threading.Thread] = None
+
+user_sessions: dict[int, dict[str, Any]] = {}
+active_shifts: dict[int, dict[str, datetime]] = {}
+_promotions_cache: list[dict[str, Any]] = []
+_promotions_cache_at = 0.0
+
+
+@contextmanager
+def db_connect() -> Iterator[sqlite3.Connection]:
+    """Open a short-lived SQLite connection and always commit/close it."""
+    conn = sqlite3.connect(DATABASE_FILE, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_database() -> None:
+    with DB_LOCK, db_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_sessions (
+            user_id INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS active_shifts (
+            user_id INTEGER PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            ends_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS webhook_events (
+            event_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt REAL NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            last_error TEXT NOT NULL DEFAULT ''
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_webhook_events_ready ON webhook_events(status, next_attempt, created_at)")
+        conn.execute(
+            "UPDATE webhook_events SET status='failed', updated_at=?, "
+            "last_error='Previous process stopped while processing; inspect before manual replay' "
+            "WHERE status='processing'",
+            (time.time(),),
+        )
+        conn.execute("DELETE FROM webhook_events WHERE status IN ('done','failed') AND created_at < ?", (time.time() - 30 * 86400,))
+    if os.name == "posix":
+        try:
+            DATABASE_FILE.chmod(0o600)
+        except OSError:
+            pass
+
+
+init_database()
 
 SERVICES = [
     "Консультация", "ПРОФ гигиена", "Лечение кариеса", "Удаление зуба", "Имплантация",
@@ -85,21 +257,69 @@ DOCTORS = [
     'Калайджян Анна Робертовна',
 ]
 DOCTORS_PER_PAGE = 5
-user_sessions: dict[int, dict[str, Any]] = {}
-active_shifts: dict[int, dict[str, datetime]] = {}
-_promotions_cache: list[dict[str, Any]] = []
-_promotions_cache_at = 0.0
 
 
 def session_for(user_id: int, first_name: str = "Пациент") -> dict[str, Any]:
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            "name": first_name or "Пациент", "auth": False, "phone": "", "step": None,
-            "pending_action": None, "appointment": {},
-        }
-    elif first_name and user_sessions[user_id].get("name") in (None, "Пациент"):
-        user_sessions[user_id]["name"] = first_name
-    return user_sessions[user_id]
+    """Get a cached session; load it from SQLite after a process restart."""
+    user_id = int(user_id)
+    with SESSION_LOCK:
+        if user_id not in user_sessions:
+            payload: dict[str, Any] = {}
+            try:
+                with db_connect() as conn:
+                    row = conn.execute("SELECT payload FROM user_sessions WHERE user_id=?", (user_id,)).fetchone()
+                if row:
+                    loaded = json.loads(row["payload"])
+                    if isinstance(loaded, dict):
+                        payload = loaded
+            except (sqlite3.Error, json.JSONDecodeError):
+                logger.exception("Не удалось загрузить сессию пользователя MAX user_id=%s", user_id)
+            if not payload:
+                payload = {
+                    "name": first_name or "Пациент", "auth": False, "auth_until": 0,
+                    "phone": "", "step": None, "pending_action": None, "appointment": {},
+                }
+            user_sessions[user_id] = payload
+        elif first_name and user_sessions[user_id].get("name") in (None, "Пациент"):
+            user_sessions[user_id]["name"] = first_name
+        return user_sessions[user_id]
+
+
+def persist_session(user_id: int) -> None:
+    with SESSION_LOCK:
+        payload = user_sessions.get(int(user_id))
+        if payload is None:
+            return
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with DB_LOCK, db_connect() as conn:
+        conn.execute(
+            "INSERT INTO user_sessions(user_id,payload,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+            (int(user_id), encoded, time.time()),
+        )
+
+
+def load_active_shifts() -> None:
+    now = datetime.now(CLINIC_TZ)
+    with DB_LOCK, db_connect() as conn:
+        rows = conn.execute("SELECT user_id, started_at, ends_at FROM active_shifts").fetchall()
+        for row in rows:
+            try:
+                started = datetime.fromisoformat(row["started_at"])
+                ends = datetime.fromisoformat(row["ends_at"])
+                if ends.tzinfo is None:
+                    started = started.replace(tzinfo=CLINIC_TZ)
+                    ends = ends.replace(tzinfo=CLINIC_TZ)
+                if ends > now:
+                    active_shifts[int(row["user_id"])] = {"start_time": started, "end_time": ends}
+                else:
+                    conn.execute("DELETE FROM active_shifts WHERE user_id=?", (int(row["user_id"]),))
+            except (ValueError, TypeError):
+                logger.warning("Удалена некорректная запись смены MAX user_id=%s", row["user_id"])
+                conn.execute("DELETE FROM active_shifts WHERE user_id=?", (int(row["user_id"]),))
+
+
+load_active_shifts()
 
 
 def normalize_phone(value: str) -> Optional[str]:
@@ -139,20 +359,26 @@ def promotion_by_id(promo_id: str | int) -> Optional[dict[str, Any]]:
 
 
 def save_pending_request(payload: dict[str, Any]) -> None:
-    try:
-        existing: list[Any] = []
-        if PENDING_FILE.exists():
-            raw = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                existing = raw
-        existing.append({**payload, "saved_at": datetime.now().astimezone().isoformat(timespec="seconds")})
-        PENDING_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        logger.exception("Не удалось сохранить резервное обращение")
+    """Write failed CRM submissions to a durable local queue (atomic replace)."""
+    with PENDING_LOCK:
+        try:
+            existing: list[Any] = []
+            if PENDING_FILE.exists():
+                raw = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    existing = raw
+            existing.append({**payload, "saved_at": datetime.now(CLINIC_TZ).isoformat(timespec='seconds')})
+            temp_path = PENDING_FILE.with_suffix(".json.tmp")
+            temp_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temp_path, PENDING_FILE)
+            if os.name == "posix":
+                PENDING_FILE.chmod(0o600)
+        except Exception:
+            logger.exception("Не удалось сохранить резервное обращение")
 
 
 def bitrix_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    if not BITRIX24_WEBHOOK:
+    if not BITRIX24_WEBHOOK or BITRIX24_WEBHOOK.startswith("PASTE_NEW_"):
         return {"error": "BITRIX24_WEBHOOK не настроен"}
     try:
         resp = requests.post(f"{BITRIX24_WEBHOOK}/{method}", json=params, timeout=15)
@@ -173,11 +399,17 @@ def lead_id_from(result: dict[str, Any]) -> Optional[str]:
 
 def create_lead(title: str, user_id: int, description: str, phone: str = "") -> dict[str, Any]:
     user = session_for(user_id)
-    result = bitrix_call("crm.item.add", {"entityTypeId": 1, "fields": {
-        "title": title[:255], "name": (user.get("name") or "Пациент")[:100],
-        "comments": description, "sourceId": "WEB", "assignedById": BITRIX_ASSIGNED_BY_ID,
-        "OPENED": "Y", "observers": ADMIN_IDS,
-    }})
+    fields: dict[str, Any] = {
+        "title": title[:255],
+        "name": (user.get("name") or "Пациент")[:100],
+        "comments": description,
+        "sourceId": "WEB",
+        "assignedById": BITRIX_ASSIGNED_BY_ID,
+        "OPENED": "Y",
+    }
+    if BITRIX_OBSERVER_IDS:
+        fields["observers"] = BITRIX_OBSERVER_IDS
+    result = bitrix_call("crm.item.add", {"entityTypeId": 1, "fields": fields})
     new_id = lead_id_from(result)
     if new_id and phone:
         bitrix_call("crm.item.update", {"entityTypeId": 1, "id": new_id, "fields": {
@@ -190,26 +422,35 @@ def create_lead(title: str, user_id: int, description: str, phone: str = "") -> 
 
 
 def create_task_for_active_admins(title: str, description: str, priority: int = 2) -> dict[str, Any]:
-    """Создаёт задачи для администраторов, которые начали смену в MAX-боте."""
+    """Assign tasks only through an explicit MAX-user-ID -> Bitrix-user-ID map."""
     active_admins = get_active_shift_users()
     if not active_admins:
         logger.warning("Нет активных администраторов на смене")
         return {"error": "Нет администраторов на смене"}
+    if not MAX_TO_BITRIX_ADMIN_MAP:
+        logger.warning("MAX_TO_BITRIX_ADMIN_MAP не настроена; задача не будет назначена по MAX ID")
+        return {"error": "Не настроено соответствие MAX ID и Bitrix ID"}
+
     results = []
-    for admin_id in active_admins:
+    for max_admin_id in active_admins:
+        bitrix_admin_id = MAX_TO_BITRIX_ADMIN_MAP.get(max_admin_id)
+        if not bitrix_admin_id:
+            logger.warning("Для MAX admin_id=%s не задан Bitrix ID", max_admin_id)
+            continue
         result = bitrix_call("tasks.task.add", {"fields": {
             "TITLE": title[:255], "DESCRIPTION": description,
-            "RESPONSIBLE_ID": admin_id, "PRIORITY": priority,
+            "RESPONSIBLE_ID": bitrix_admin_id, "PRIORITY": priority,
         }})
         results.append(result)
         if result.get("result", {}).get("task", {}).get("id"):
             return result
-    return results[0] if results else {"error": "Ошибка создания задач"}
+    return results[0] if results else {"error": "Нет активных администраторов с настроенным Bitrix ID"}
+
 
 def create_support_request(user_id: int, subject: str, description: str, phone: str = "", priority: int = 2) -> dict[str, Any]:
     user = session_for(user_id)
     full = (f"Пациент: {user.get('name') or 'не указано'}\nТелефон: {phone or user.get('phone') or 'не указан'}\n"
-            f"MAX user_id: {user_id}\nКанал: MAX\nВремя обращения: {datetime.now().astimezone().isoformat(timespec='seconds')}\n\n{description}")
+            f"MAX user_id: {user_id}\nКанал: MAX\nВремя обращения: {datetime.now(CLINIC_TZ).isoformat(timespec='seconds')}\n\n{description}")
     task = create_task_for_active_admins(f"[MAX] {subject}", full, priority)
     if task.get("result", {}).get("task", {}).get("id"):
         return task
@@ -231,22 +472,36 @@ def create_appointment_lead(user_id: int) -> dict[str, Any]:
 
 
 def start_shift(user_id: int) -> datetime:
-    now = datetime.now()
-    end = datetime(now.year, now.month, now.day, 20, 0)
+    now = datetime.now(CLINIC_TZ)
+    end = now.replace(hour=20, minute=0, second=0, microsecond=0)
     if now >= end:
         end += timedelta(days=1)
-    active_shifts[user_id] = {"start_time": now, "end_time": end}
+    record = {"start_time": now, "end_time": end}
+    active_shifts[int(user_id)] = record
+    with DB_LOCK, db_connect() as conn:
+        conn.execute(
+            "INSERT INTO active_shifts(user_id,started_at,ends_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET started_at=excluded.started_at, ends_at=excluded.ends_at",
+            (int(user_id), now.isoformat(), end.isoformat()),
+        )
     return end
 
 
 def end_shift(user_id: int) -> bool:
-    return active_shifts.pop(user_id, None) is not None
+    existed = active_shifts.pop(int(user_id), None) is not None
+    with DB_LOCK, db_connect() as conn:
+        conn.execute("DELETE FROM active_shifts WHERE user_id=?", (int(user_id),))
+    return existed
 
 
 def get_active_shift_users() -> list[int]:
-    now = datetime.now()
-    for uid in [uid for uid, s in active_shifts.items() if now >= s["end_time"]]:
-        active_shifts.pop(uid, None)
+    now = datetime.now(CLINIC_TZ)
+    expired = [uid for uid, shift in active_shifts.items() if now >= shift["end_time"]]
+    if expired:
+        for uid in expired:
+            active_shifts.pop(uid, None)
+        with DB_LOCK, db_connect() as conn:
+            conn.executemany("DELETE FROM active_shifts WHERE user_id=?", [(uid,) for uid in expired])
     return list(active_shifts)
 
 
@@ -259,10 +514,19 @@ def link_button(text: str, url: str) -> dict[str, Any]:
 
 
 def app_button(text: str = "📱 Открыть приложение клиники") -> Optional[dict[str, Any]]:
-    # Используем существующий Mini App на Render. URL должен быть также привязан
-    # к этому боту в MAX Partner Portal: Чат-боты → Настройки → URL Mini App.
-    if MAX_MINIAPP_LINK.startswith("https://"):
-        return {"type": "open_app", "text": text[:64], "web_app": MAX_MINIAPP_LINK}
+    """Create an open_app button only when MAX bot identity is configured.
+
+    MAX open_app.web_app accepts the target bot's public username/link, not a
+    Render page URL. If the bot identity is unknown, miniapp_rows() uses a normal
+    HTTPS link button instead, which avoids MAX API 404 Link-not-found responses.
+    """
+    if MAX_BOT_CONTACT_ID:
+        return {"type": "open_app", "text": text[:128], "contact_id": MAX_BOT_CONTACT_ID}
+    bot_reference = MAX_BOT_USERNAME.strip()
+    if bot_reference:
+        if bot_reference.startswith("@"):
+            bot_reference = bot_reference[1:]
+        return {"type": "open_app", "text": text[:128], "web_app": bot_reference}
     return None
 
 
@@ -270,31 +534,67 @@ def keyboard(rows: list[list[dict[str, Any]]]) -> dict[str, Any]:
     return {"attachments": [{"type": "inline_keyboard", "payload": {"buttons": rows}}]} if rows else {}
 
 
+class MaxAPIError(RuntimeError):
+    pass
+
+
 def send_message(user_id: int, text: str, rows: Optional[list[list[dict[str, Any]]]] = None) -> dict[str, Any]:
-    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("PASTE_NEW_"):
-        logger.error("MAX_BOT_TOKEN не настроен; сообщение не отправлено")
+    """Send a MAX message. Delivery failures are logged, not raised into webhook replay."""
+    if not MAX_BOT_TOKEN or not MAX_BOT_TOKEN.strip() or MAX_BOT_TOKEN.startswith("PASTE_NEW_"):
+        logger.error("MAX_BOT_TOKEN не настроен; сообщение user_id=%s не отправлено", user_id)
         return {"error": "MAX_BOT_TOKEN не настроен"}
-    payload: dict[str, Any] = {"text": text[:4000]}
+
+    payload: dict[str, Any] = {"text": str(text)[:4000]}
     if rows:
         payload.update(keyboard(rows))
+
     try:
         response = requests.post(
-            f"{MAX_API_BASE}/messages?user_id={user_id}",
-            headers={"Authorization": MAX_BOT_TOKEN, "Content-Type": "application/json"},
-            json=payload, timeout=15,
+            f"{MAX_API_BASE}/messages",
+            params={"user_id": int(user_id)},
+            headers={"Authorization": MAX_BOT_TOKEN.strip(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=(4, 10),
         )
         if not response.ok:
-            logger.error("MAX API %s: %s", response.status_code, response.text[:500])
-        response.raise_for_status()
-        return response.json() if response.content else {"ok": True}
-    except Exception as exc:
-        logger.exception("Не удалось отправить MAX-сообщение пользователю %s", user_id)
-        return {"error": str(exc)}
+            body = response.text[:800]
+            logger.error("MAX API вернул HTTP %s при отправке сообщения: %s", response.status_code, body)
+            return {"error": f"MAX API HTTP {response.status_code}", "details": body}
+        if not response.content:
+            return {"ok": True}
+        try:
+            result = response.json()
+            if isinstance(result, dict) and result.get("error"):
+                logger.error("MAX API вернул ошибку в теле ответа: %s", result.get("error"))
+                return result
+            return result if isinstance(result, dict) else {"ok": True}
+        except ValueError:
+            logger.warning("MAX API вернул успешный HTTP-ответ не в JSON формате")
+            return {"ok": True}
+    except requests.RequestException as exc:
+        logger.exception("Ошибка сети при отправке MAX-сообщения user_id=%s", user_id)
+        return {"error": f"Ошибка сети: {type(exc).__name__}"}
 
 
-def miniapp_rows() -> list[list[dict[str, Any]]]:
-    b = app_button()
-    return [[b]] if b else []
+def max_bot_profile_url() -> str:
+    """Return a shareable MAX bot URL, or an empty string if username is unknown."""
+    reference = MAX_BOT_USERNAME.strip()
+    if reference.startswith("@"):
+        reference = reference[1:]
+    if reference.startswith("https://"):
+        return reference.rstrip("/")
+    if reference:
+        return f"https://max.ru/{reference}"
+    return ""
+
+
+def miniapp_rows(text: str = "📱 Открыть приложение клиники") -> list[list[dict[str, Any]]]:
+    button = app_button(text)
+    if button:
+        return [[button]]
+    if MAX_MINIAPP_LINK.startswith("https://"):
+        return [[link_button(text[:64], MAX_MINIAPP_LINK)]]
+    return []
 
 
 def send_main_menu(user_id: int) -> None:
@@ -313,8 +613,10 @@ def send_main_menu(user_id: int) -> None:
 
 def require_auth(user_id: int, action: str) -> bool:
     user = session_for(user_id)
-    if user.get("auth"):
+    auth_until = float(user.get("auth_until") or 0)
+    if user.get("auth") and auth_until > time.time():
         return True
+    user["auth"] = False
     user["pending_action"] = action
     user["step"] = "waiting_phone"
     send_message(user_id, "🔐 Для этой функции нужно подтвердить номер телефона.\n\nВведите российский номер, например +7 988 233-77-25.\nSMS-провайдер пока не подключён: после номера будет предложен временный код 1234.", [[callback("⬅️ Главное меню", "back_to_menu")]])
@@ -402,15 +704,16 @@ def process_code(user_id: int, text: str) -> None:
         send_message(user_id, "Неверный временный код. Попробуйте ещё раз.")
         return
     user["auth"] = True
+    user["auth_until"] = time.time() + 24 * 60 * 60
     user["step"] = None
-    send_message(user_id, "✅ Временное подтверждение выполнено. Реальная SMS-проверка не подключена.")
+    send_message(user_id, "✅ Временное подтверждение выполнено. Реальная SMS-проверка не подключена; тестовый доступ действует 24 часа.")
     dispatch_after_auth(user_id)
 
 
 def show_my_visits(user_id: int) -> None:
     send_message(user_id, "📅 Мои визиты\n\nПолучение реальных визитов из МИС «Инфоклиника» пока не подключено. Я не буду показывать фиктивные записи или имитировать подтверждение, перенос и отмену. Можно отправить запрос администратору.", [
         [callback("📨 Запросить информацию о визитах", "visits_request")],
-        [app_button("Открыть приложение клиники")] if app_button() else [callback("🏠 Главное меню", "back_to_menu")],
+        *miniapp_rows(),
         [callback("⬅️ Главное меню", "back_to_menu")],
     ])
 
@@ -423,9 +726,7 @@ def show_services(user_id: int, appointment_flow: bool = False) -> None:
         note = "🦷 Запись на приём\n\nВыберите одну из 9 согласованных услуг. Дату и время можно указать как пожелание — фактическое свободное окно подтвердит администратор, поскольку МИС «Инфоклиника» не подключена."
     else:
         rows = [[callback(category, f"service_category_{i}")] for i, category in enumerate(SERVICE_CATEGORIES)]
-        b = app_button("📱 Полный каталог и цены в Mini App")
-        if b:
-            rows.append([b])
+        rows.extend(miniapp_rows("📱 Полный каталог и цены в Mini App"))
         rows.append([callback("🦷 Записаться", "appointment")])
         rows.append([callback("⬅️ Главное меню", "back_to_menu")])
         note = "📋 Услуги и цены\n\nВыберите направление. Подробные карточки с составом, показаниями, длительностью, актуальной ценой и врачами доступны в существующем Mini App. В чате не публикуем неподтверждённые цены и соответствия врачей."
@@ -438,9 +739,7 @@ def show_service_category_detail(user_id: int, index: int) -> None:
         return
     category = SERVICE_CATEGORIES[index]
     rows = []
-    b = app_button("📱 Открыть карточки в Mini App")
-    if b:
-        rows.append([b])
+    rows.extend(miniapp_rows("📱 Открыть карточки в Mini App"))
     rows.extend([
         [callback("🦷 Оставить заявку по направлению", f"service_category_book_{index}")],
         [callback("⬅️ К услугам и ценам", "services")],
@@ -464,9 +763,7 @@ def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) ->
         rows.extend([[callback("Пусть врача подберёт администратор", "book_doctor_unknown")], [callback("⬅️ К услугам", "book_change_service")]])
         txt = "Выберите врача только как пожелание. Связь «услуга → врач» ещё не подтверждена, поэтому администратор проверит, оказывает ли выбранный специалист эту услугу. Можно поручить подбор администратору."
     else:
-        b = app_button("Карточки врачей в Mini App")
-        if b:
-            rows.append([b])
+        rows.extend(miniapp_rows("Карточки врачей в Mini App"))
         rows.append([callback("⬅️ Главное меню", "back_to_menu")])
         txt = "👩‍⚕️ Врачи клиники\n\nСписок ФИО из предоставленного файла. Специализации, ключевые услуги, стаж и свободные окна в MAX не приписываем без проверенных данных. Полные карточки доступны в Mini App."
     send_message(user_id, txt, rows)
@@ -474,7 +771,7 @@ def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) ->
 
 def show_booking_dates(user_id: int) -> None:
     rows = []
-    today = date.today()
+    today = datetime.now(CLINIC_TZ).date()
     weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     for offset in range(1, 8):
         day = today + timedelta(days=offset)
@@ -559,9 +856,7 @@ def show_promotions(user_id: int) -> None:
         send_message(user_id, "Список акций сейчас недоступен. Уточните предложения у администратора или откройте Mini App.", miniapp_rows() + [[callback("💬 Написать администратору", "support")], [callback("⬅️ Главное меню", "back_to_menu")]])
         return
     rows = [[callback(f"🎁 {p.get('title','Акция')} · {p.get('price','')}", f"promo_open_{p.get('id')}")] for p in promos]
-    b = app_button("Открыть акции в Mini App")
-    if b:
-        rows.append([b])
+    rows.extend(miniapp_rows("Открыть акции в Mini App"))
     rows.append([callback("⬅️ Главное меню", "back_to_menu")])
     send_message(user_id, "🎁 Акции и предложения\n\nСписок загружается из файла существующего Mini App. Сроки части предложений в исходной таблице не указаны; перед записью администратор подтвердит актуальность условий.", rows)
 
@@ -601,7 +896,7 @@ def submit_emergency(user_id: int) -> None:
     problem = user.pop("emergency_problem", "Экстренное обращение")
     comment = user.pop("emergency_comment", "")
     phone = user.get("phone", "")
-    description = f"Проблема: {problem}\nКомментарий пациента: {comment}\nВремя обращения: {datetime.now().astimezone().isoformat(timespec='seconds')}"
+    description = f"Проблема: {problem}\nКомментарий пациента: {comment}\nВремя обращения: {datetime.now(CLINIC_TZ).isoformat(timespec='seconds')}"
     result = create_support_request(user_id, f"ЭКСТРЕННОЕ обращение: {problem}", description, phone, priority=1)
     task_id = result.get("result", {}).get("task", {}).get("id")
     lead_id = lead_id_from(result)
@@ -623,25 +918,30 @@ def begin_support(user_id: int) -> None:
 def handle_text(user_id: int, text: str) -> None:
     user = session_for(user_id)
     state = user.get("step")
-    if text.lower() in ("/start", "/menu", "меню", "главное меню"):
+    command = (text or "").strip().lower().split(maxsplit=1)[0] if (text or "").strip() else ""
+    if command in ("/start", "/menu") or command.startswith("/start@") or command.startswith("/menu@") or text.strip().lower() in ("меню", "главное меню"):
         user["step"] = None
         send_main_menu(user_id)
         return
-    if text == "/shift_start":
-        if user_id not in ADMIN_IDS:
+    if command == "/shift_start":
+        if user_id not in MAX_ADMIN_IDS:
             send_message(user_id, "Команда доступна только администраторам.")
             return
         end = start_shift(user_id)
         send_message(user_id, f"Смена начата до {end:%H:%M}. Активных администраторов: {len(get_active_shift_users())}.")
         return
-    if text == "/shift_end":
-        if user_id not in ADMIN_IDS:
+    if command == "/shift_end":
+        if user_id not in MAX_ADMIN_IDS:
             send_message(user_id, "Команда доступна только администраторам.")
             return
         send_message(user_id, "Смена завершена." if end_shift(user_id) else "У вас нет активной смены.")
         return
-    if text == "/shift_status":
-        send_message(user_id, "На смене: " + (", ".join(map(str, get_active_shift_users())) if get_active_shift_users() else "сейчас никого нет"))
+    if command in ("/shift_status", "/shiftstatus"):
+        if user_id not in MAX_ADMIN_IDS:
+            send_message(user_id, "Команда доступна только администраторам.")
+            return
+        active = get_active_shift_users()
+        send_message(user_id, "На смене: " + (", ".join(map(str, active)) if active else "сейчас никого нет"))
         return
     if state == "waiting_phone":
         process_phone(user_id, text)
@@ -756,20 +1056,23 @@ def dispatch_callback(user_id: int, data: str) -> None:
                 "Парковка: городская платная. Оплата: наличными и безналичным способом.\n\n"
                 "Преимущества: комплексный подход, цифровые технологии, лечение под микроскопом, КЛКТ-диагностика, имплантация и сложные случаи, лечение во сне и седация.\n\n"
                 "Видео о клинике и полные сведения доступны в приложении клиники.")
-        app = app_button("📱 Видео и подробности в Mini App")
         rows = [[link_button("🌐 Сайт клиники", "https://alfadentstom.ru/")], [link_button("📍 Яндекс Карты", YANDEX_MAPS_URL)]]
-        if app:
-            rows.append([app])
+        rows.extend(miniapp_rows("📱 Видео и подробности в Mini App"))
         rows.extend([[callback("🦷 Записаться", "appointment")], [callback("⬅️ Главное меню", "back_to_menu")]])
         send_message(user_id, text, rows)
     elif data == "reviews":
         rows = [[link_button("⭐ Яндекс Карты", YANDEX_MAPS_URL)], [link_button("⭐ ПроДокторов", "https://prodoctorov.ru/sochi/alfadent/")], [link_button("⭐ 2ГИС", "https://2gis.ru/sochi/firm/alfadent/reviews")], [callback("⬅️ Главное меню", "back_to_menu")]]
         send_message(user_id, "⭐ Отзывы\n\nПроверьте актуальность страниц перед публикацией.", rows)
     elif data == "referral":
-        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else MAX_MINIAPP_LINK
+        profile_url = max_bot_profile_url()
+        if profile_url:
+            link = f"{profile_url}?startapp=ref_{user_id}" if "?" not in profile_url else f"{profile_url}&startapp=ref_{user_id}"
+        else:
+            link = MAX_MINIAPP_LINK
         send_message(user_id, f"💛 Рекомендовать клинику\n\nПоделитесь ссылкой с друзьями. Условия бонусов не обещаем без согласования.\n\n{link}", [[link_button("📤 Поделиться ссылкой", link)], [callback("📋 Показать ссылку", "referral_show")], [callback("⬅️ Главное меню", "back_to_menu")]])
     elif data == "referral_show":
-        link = f"https://max.ru/{MAX_BOT_USERNAME}?startapp=ref_{user_id}" if MAX_BOT_USERNAME else MAX_MINIAPP_LINK
+        profile_url = max_bot_profile_url()
+        link = (f"{profile_url}?startapp=ref_{user_id}" if "?" not in profile_url else f"{profile_url}&startapp=ref_{user_id}") if profile_url else MAX_MINIAPP_LINK
         send_message(user_id, link, [[callback("⬅️ Главное меню", "back_to_menu")]])
     elif data == "support":
         begin_support(user_id)
@@ -801,7 +1104,7 @@ def dispatch_callback(user_id: int, data: str) -> None:
     elif data == "book_change_service":
         show_services(user_id, appointment_flow=True)
     elif data == "book_change_doctor":
-        show_doctor_choice_for_booking(user_id)
+        show_doctors(user_id, 0, appointment_flow=True)
     elif data.startswith("book_date_"):
         raw = data.removeprefix("book_date_")
         try: a["date"] = datetime.strptime(raw, "%Y%m%d").strftime("%d.%m.%Y")
@@ -826,54 +1129,225 @@ def dispatch_callback(user_id: int, data: str) -> None:
         send_message(user_id, "Не удалось распознать действие. Вернитесь в главное меню.", [[callback("🏠 Главное меню", "back_to_menu")]])
 
 
-def handle_update(data: dict[str, Any]) -> None:
+def update_user_id(data: dict[str, Any]) -> Optional[int]:
     update_type = data.get("update_type")
     if update_type == "bot_started":
-        message = data.get("message", {}) or {}
-        sender = message.get("sender", {}) or {}
-        user_id = sender.get("user_id")
-        if user_id is not None:
-            session_for(int(user_id), sender.get("first_name", "Пациент"))["step"] = None
-            send_main_menu(int(user_id))
-    elif update_type == "message_created":
-        message = data.get("message", {}) or {}
-        sender = message.get("sender", {}) or {}
-        user_id = sender.get("user_id")
-        if user_id is not None:
-            user_id = int(user_id)
-            session_for(user_id, sender.get("first_name", "Пациент"))
-            body = message.get("body", {}) or {}
-            handle_text(user_id, str(body.get("text") or "").strip())
+        user = data.get("user") or {}
+        if not user:
+            user = (data.get("message") or {}).get("sender") or {}
     elif update_type == "message_callback":
-        callback_data = data.get("callback", {}) or {}
-        user = callback_data.get("user", {}) or {}
-        user_id = user.get("user_id")
-        if user_id is None:
-            sender = (data.get("message", {}) or {}).get("sender", {}) or {}
-            user_id = sender.get("user_id")
-        if user_id is not None:
-            dispatch_callback(int(user_id), str(callback_data.get("payload") or ""))
+        callback_data = data.get("callback") or {}
+        user = callback_data.get("user") or {}
+        if not user:
+            user = ((data.get("message") or {}).get("sender") or {})
+    elif update_type in {"message_created", "bot_stopped", "bot_added", "bot_removed"}:
+        if update_type == "message_created":
+            user = ((data.get("message") or {}).get("sender") or {})
+        else:
+            user = data.get("user") or {}
     else:
-        logger.info("Игнорируем событие MAX update_type=%s", update_type)
+        user = {}
+    raw_id = user.get("user_id") if isinstance(user, dict) else None
+    try:
+        return int(raw_id) if raw_id is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def handle_update(data: dict[str, Any]) -> None:
+    update_type = data.get("update_type")
+    user_id = update_user_id(data)
+    logger.info("Получено событие MAX: type=%s", update_type)
+    try:
+        if update_type == "bot_started":
+            # MAX Update.bot_started stores the starter in top-level `user`.
+            sender = data.get("user") or {}
+            if not sender:
+                sender = ((data.get("message") or {}).get("sender") or {})
+            if user_id is not None:
+                first_name = sender.get("first_name") or sender.get("name") or "Пациент"
+                user = session_for(user_id, first_name)
+                user["step"] = None
+                send_main_menu(user_id)
+            else:
+                logger.warning("bot_started: в событии не найден user.user_id")
+
+        elif update_type == "message_created":
+            message = data.get("message") or {}
+            sender = message.get("sender") or {}
+            if user_id is not None:
+                first_name = sender.get("first_name") or sender.get("name") or "Пациент"
+                session_for(user_id, first_name)
+                body = message.get("body") or {}
+                text_value = body.get("text") or message.get("text") or ""
+                handle_text(user_id, str(text_value).strip())
+            else:
+                logger.warning("message_created: в message.sender не найден user_id")
+
+        elif update_type == "message_callback":
+            callback_data = data.get("callback") or {}
+            payload = str(callback_data.get("payload") or "")
+            if user_id is not None:
+                callback_user = callback_data.get("user") or {}
+                first_name = callback_user.get("first_name") or callback_user.get("name") or "Пациент"
+                session_for(user_id, first_name)
+                dispatch_callback(user_id, payload)
+            else:
+                logger.warning("message_callback: в callback.user не найден user_id")
+
+        elif update_type == "bot_stopped":
+            if user_id is not None:
+                with SESSION_LOCK:
+                    user_sessions.pop(user_id, None)
+                with DB_LOCK, db_connect() as conn:
+                    conn.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
+                logger.info("Пользователь остановил MAX-бота; сессия очищена")
+
+        else:
+            logger.info("Событие MAX пропущено: update_type=%s", update_type)
+    finally:
+        if user_id is not None and update_type != "bot_stopped":
+            persist_session(user_id)
+
+
+def update_fingerprint(data: dict[str, Any]) -> str:
+    canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def enqueue_webhook_update(data: dict[str, Any]) -> bool:
+    """Persist update before acknowledging MAX; unique hash prevents duplicate delivery."""
+    event_key = update_fingerprint(data)
+    now = time.time()
+    encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    with DB_LOCK, db_connect() as conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO webhook_events(event_key,payload,status,attempts,next_attempt,created_at,updated_at,last_error) "
+            "VALUES(?,?,'pending',0,?,?,?,'')",
+            (event_key, encoded, now, now, now),
+        )
+        inserted = cursor.rowcount > 0
+    if inserted:
+        WEBHOOK_QUEUE_WAKE.set()
+    return inserted
+
+
+def process_webhook_queue() -> None:
+    """Process persisted events once; failed events are stored for manual inspection."""
+    while not WEBHOOK_WORKER_STOP.is_set():
+        row = None
+        try:
+            with DB_LOCK, db_connect() as conn:
+                row = conn.execute(
+                    "SELECT event_key,payload,attempts FROM webhook_events "
+                    "WHERE status='pending' AND next_attempt<=? ORDER BY created_at LIMIT 1",
+                    (time.time(),),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE webhook_events SET status='processing', updated_at=? WHERE event_key=? AND status='pending'",
+                        (time.time(), row["event_key"]),
+                    )
+        except sqlite3.Error:
+            logger.exception("Ошибка чтения очереди MAX webhook; worker повторит проверку через 2 секунды")
+            WEBHOOK_WORKER_STOP.wait(2.0)
+            continue
+        if not row:
+            WEBHOOK_QUEUE_WAKE.wait(2.0)
+            WEBHOOK_QUEUE_WAKE.clear()
+            continue
+
+        event_key = row["event_key"]
+        attempts = int(row["attempts"] or 0) + 1
+        try:
+            payload = json.loads(row["payload"])
+            if not isinstance(payload, dict):
+                raise ValueError("Webhook payload is not a JSON object")
+            handle_update(payload)
+            with DB_LOCK, db_connect() as conn:
+                conn.execute(
+                    "UPDATE webhook_events SET status='done', attempts=?, updated_at=?, last_error='' WHERE event_key=?",
+                    (attempts, time.time(), event_key),
+                )
+            logger.info("Событие MAX обработано успешно (attempt=%s)", attempts)
+        except Exception as exc:
+            # A webhook may already have created a CRM lead/task before the exception.
+            # Automatic replay could duplicate that side effect. Store it for inspection.
+            logger.exception("Ошибка обработки события MAX; автоматический повтор отключён")
+            try:
+                with DB_LOCK, db_connect() as conn:
+                    conn.execute(
+                        "UPDATE webhook_events SET status='failed', attempts=?, updated_at=?, last_error=? WHERE event_key=?",
+                        (attempts, time.time(), f"{type(exc).__name__}: {str(exc)[:500]}", event_key),
+                    )
+            except sqlite3.Error:
+                logger.exception("Не удалось записать статус failed в очередь MAX webhook")
+            logger.error("Событие MAX помещено в failed без автоматического повтора; проверьте очередь через /health и БД %s", DATABASE_FILE)
+
+
+def start_webhook_worker() -> None:
+    global WEBHOOK_WORKER_THREAD
+    if WEBHOOK_WORKER_THREAD and WEBHOOK_WORKER_THREAD.is_alive():
+        return
+    WEBHOOK_WORKER_STOP.clear()
+    WEBHOOK_WORKER_THREAD = threading.Thread(target=process_webhook_queue, name="max-webhook-worker", daemon=True)
+    WEBHOOK_WORKER_THREAD.start()
+
+
+def webhook_secret_is_valid(path_secret: Optional[str] = None) -> bool:
+    expected = MAX_WEBHOOK_SECRET.strip()
+    if not expected:
+        return not MAX_REQUIRE_WEBHOOK_SECRET
+    supplied = request.headers.get("X-Max-Bot-Api-Secret", "").strip()
+    # Compatibility: the current Quick Tunnel supervisor appends the secret to /webhook/<secret>.
+    # MAX's recommended mechanism is the X-Max-Bot-Api-Secret header.
+    if not supplied and path_secret:
+        supplied = path_secret.strip()
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
+
+
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "alfadent-max-bot", "health": "/health"})
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "alfadent-max-bot", "max_token_configured": bool(MAX_BOT_TOKEN and not MAX_BOT_TOKEN.startswith("PASTE_NEW_")), "bitrix_configured": bool(BITRIX24_WEBHOOK), "promotions_loaded": len(load_promotions())})
+    with DB_LOCK, db_connect() as conn:
+        queue_counts = {
+            row["status"]: row["count"]
+            for row in conn.execute("SELECT status, COUNT(*) AS count FROM webhook_events GROUP BY status").fetchall()
+        }
+    return jsonify({
+        "ok": True,
+        "service": "alfadent-max-bot",
+        "max_token_configured": bool(MAX_BOT_TOKEN and MAX_BOT_TOKEN.strip() and not MAX_BOT_TOKEN.startswith("PASTE_NEW_")),
+        "bitrix_configured": bool(BITRIX24_WEBHOOK and not BITRIX24_WEBHOOK.startswith("PASTE_NEW_")),
+        "webhook_secret_configured": bool(MAX_WEBHOOK_SECRET.strip()),
+        "webhook_secret_required": MAX_REQUIRE_WEBHOOK_SECRET,
+        "miniapp_open_app_configured": bool(MAX_BOT_USERNAME or MAX_BOT_CONTACT_ID),
+        "promotions_cache_count": len(_promotions_cache),
+        "webhook_queue": queue_counts,
+    })
 
 
 def process_webhook(path_secret: Optional[str] = None):
-    if MAX_WEBHOOK_SECRET and path_secret != MAX_WEBHOOK_SECRET:
-        return jsonify({"error": "forbidden"}), 403
+    if MAX_REQUIRE_WEBHOOK_SECRET and not MAX_WEBHOOK_SECRET.strip():
+        logger.error("Webhook отклонён: MAX_REQUIRE_WEBHOOK_SECRET=1, но MAX_WEBHOOK_SECRET не настроен")
+        return jsonify({"error": "webhook secret is not configured"}), 503
+    if MAX_WEBHOOK_SECRET and not webhook_secret_is_valid(path_secret):
+        logger.warning("Webhook отклонён: неверный X-Max-Bot-Api-Secret")
+        return jsonify({"error": "forbidden"}), 401
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return jsonify({"status": "ignored", "reason": "invalid json"}), 200
+        return jsonify({"status": "ignored", "reason": "invalid json"}), 400
     try:
-        handle_update(data)
-    except Exception:
-        logger.exception("Ошибка обработки MAX webhook")
-    # Answer 200 to avoid endless redelivery; errors are preserved in logs.
-    return jsonify({"status": "ok"}), 200
+        inserted = enqueue_webhook_update(data)
+    except sqlite3.Error:
+        logger.exception("Не удалось записать входящий webhook MAX в очередь")
+        return jsonify({"status": "queue_error"}), 500
+    # MAX expects a fast HTTP 200. The durable local worker handles the event afterwards.
+    return jsonify({"status": "queued" if inserted else "duplicate"}), 200
 
 
 @app.post("/webhook")
@@ -887,16 +1361,47 @@ def webhook_with_secret(path_secret: str):
 
 
 def main() -> None:
-    if not MAX_BOT_TOKEN or MAX_BOT_TOKEN.startswith("PASTE_NEW_"):
-        raise RuntimeError("Укажите новый MAX_BOT_TOKEN в конфигурации сервера.")
+    if not MAX_API_BASE.startswith("https://"):
+        raise RuntimeError("MAX_API_BASE должен быть HTTPS URL.")
+    if not MAX_BOT_TOKEN or not MAX_BOT_TOKEN.strip() or MAX_BOT_TOKEN.startswith("PASTE_NEW_"):
+        raise RuntimeError("MAX_BOT_TOKEN не настроен. Добавьте новый токен в /etc/alfadent/max_bot.env.")
     if not BITRIX24_WEBHOOK or BITRIX24_WEBHOOK.startswith("PASTE_NEW_"):
-        logger.warning("BITRIX24_WEBHOOK не настроен: CRM-заявки не будут переданы автоматически.")
-    if not MAX_MINIAPP_LINK.startswith("https://"):
-        logger.warning("MAX_MINIAPP_LINK должен быть публичным HTTPS URL.")
-    if not MAX_BOT_USERNAME:
-        logger.info("Публичное имя MAX-бота не задано: кнопка рекомендаций использует прямой URL Mini App.")
-    logger.info("Кнопка Mini App направлена на %s; URL также должен быть привязан в MAX Partner Portal.", MAX_MINIAPP_LINK)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+        logger.warning("BITRIX24_WEBHOOK не настроен: обращения будут сохраняться в локальную резервную очередь.")
+    if MAX_WEBHOOK_SECRET.strip() and not re.fullmatch(r"[A-Za-z0-9_-]{5,256}", MAX_WEBHOOK_SECRET.strip()):
+        raise RuntimeError("MAX_WEBHOOK_SECRET должен содержать 5–256 символов: латинские буквы, цифры, дефис или подчёркивание.")
+    if not MAX_WEBHOOK_SECRET.strip():
+        message = "MAX_WEBHOOK_SECRET не настроен: webhook не будет проверяться на подлинность. Рекомендуется задать секрет в MAX и в конфигурации сервера."
+        if MAX_REQUIRE_WEBHOOK_SECRET:
+            raise RuntimeError(message)
+        logger.warning(message)
+    if not (MAX_BOT_USERNAME or MAX_BOT_CONTACT_ID):
+        logger.warning("MAX_BOT_USERNAME/MAX_BOT_CONTACT_ID не заданы: в сообщениях будет обычная HTTPS-ссылка Mini App, не open_app.")
+    if not MAX_TO_BITRIX_ADMIN_MAP:
+        logger.warning("MAX_TO_BITRIX_ADMIN_MAP не задана: задачи смены не будут назначаться на MAX ID; будет создан лид Bitrix24.")
+    if not MAX_ADMIN_IDS:
+        logger.warning("MAX_ADMIN_IDS пуст: команды /shift_start, /shift_end доступны никому.")
+    if BITRIX_ASSIGNED_BY_ID <= 0:
+        raise RuntimeError("BITRIX_ASSIGNED_BY_ID должен быть положительным Bitrix24 user ID.")
+
+    try:
+        from waitress import serve
+    except ImportError as exc:
+        raise RuntimeError("Не установлен Waitress. Выполните: .venv/bin/pip install waitress") from exc
+
+    start_webhook_worker()
+    host = os.getenv("API_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    port = env_int("API_PORT", 5000)
+    if not 1 <= port <= 65535:
+        raise RuntimeError("API_PORT должен находиться в диапазоне 1–65535.")
+    threads = max(2, min(env_int("WEB_THREADS", 8), 32))
+    logger.info("Запуск MAX webhook через Waitress на %s:%s (threads=%s)", host, port, threads)
+    try:
+        serve(app, host=host, port=port, threads=threads, channel_timeout=30, cleanup_interval=30)
+    finally:
+        WEBHOOK_WORKER_STOP.set()
+        WEBHOOK_QUEUE_WAKE.set()
+        if WEBHOOK_WORKER_THREAD:
+            WEBHOOK_WORKER_THREAD.join(timeout=5)
 
 
 if __name__ == "__main__":
