@@ -1,9 +1,13 @@
-"""Telegram-бот клиники «АльфаДент».
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Чат-версия Telegram-бота клиники «АльфаДент».
 
-Заявки на приём создаются в Bitrix24 и требуют подтверждения администратора;
-прямое бронирование свободного окна, визиты, перенос и отмена требуют интеграции
-с МИС «Инфоклиника». До подключения SMS/OTP используется временный фиксированный
-код подтверждения номера 1234.
+Важно:
+- реальные слоты и операции с визитами не имитируются: без API МИС бот создаёт заявку
+  и прямо сообщает, что запись подтвердит администратор;
+- SMS/OTP-провайдер в исходных материалах не предоставлен. Для теста можно включить
+  AUTH_MODE=demo и DEMO_OTP_CODE=1234. Перед эксплуатацией подключить настоящий OTP;
+- секреты задаются переменными окружения, а не хранятся в исходнике.
 """
 
 import asyncio
@@ -27,23 +31,16 @@ from telegram.ext import (
     MessageHandler, filters,
 )
 
-# ========== БИТРИКС24 ==========
-BITRIX24_WEBHOOK = "https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/"
-
 # ---------------- CONFIGURATION ----------------
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "PASTE_NEW_TELEGRAM_BOT_TOKEN_HERE").strip()
-BITRIX24_WEBHOOK_RAW = os.getenv("BITRIX24_WEBHOOK", "PASTE_NEW_BITRIX24_WEBHOOK_HERE").strip().rstrip("/")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://alfadent-miniapp.onrender.com/miniapp.html").strip().rstrip("/")
-# SOCKS5-прокси используется только для запросов Telegram Bot API и getUpdates.
-# Укажите НОВЫЕ действующие учётные данные: прежние данные попадали в скриншоты.
-# Спецсимволы в логине/пароле необходимо URL-кодировать.
-TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "socks5://LOGIN:PASSWORD@IP:PORT").strip()
-BITRIX24_WEBHOOK = BITRIX24_WEBHOOK_RAW + "/" if BITRIX24_WEBHOOK_RAW and not BITRIX24_WEBHOOK_RAW.startswith("PASTE_NEW_") else ""
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+BITRIX24_WEBHOOK_RAW = os.getenv("BITRIX24_WEBHOOK", "").strip().rstrip("/")
+# Render / route serves web/miniapp.html; override via WEBAPP_URL in .env if needed.
+WEBAPP_URL = (os.getenv("WEBAPP_URL") or "https://alfadent-miniapp.onrender.com/").strip().rstrip("/")
+BITRIX24_WEBHOOK = BITRIX24_WEBHOOK_RAW + "/" if BITRIX24_WEBHOOK_RAW else ""
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-BITRIX_ADMIN_IDS = [int(x.strip()) for x in os.getenv("BITRIX_ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-# Временный фиксированный код подтверждения до подключения SMS/OTP-провайдера.
-OTP_CODE = "1234"
+AUTH_MODE = os.getenv("AUTH_MODE", "sms_not_configured").strip().lower()  # demo | sms_not_configured
+DEMO_OTP_CODE = os.getenv("DEMO_OTP_CODE", "1234").strip()
 CLINIC_PHONE = "+7 (988) 233-77-25"
 CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски»."
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
@@ -63,47 +60,35 @@ logger = logging.getLogger("alfadent_bot")
 user_sessions: Dict[int, Dict[str, Any]] = {}
 active_shifts: Dict[int, Dict[str, datetime]] = {}
 
-# В списке — имена из файла бота; непроверенные специальности, цены и расписание не добавляем.
+# Список взят из исходного файла. Специальности, фото, стаж, цены и расписание не выдумываем.
 DOCTORS = [
-    "Батаева Анжела Маусыровна", "Бобовский Николай Анатольевич",
-    "Богуцкий Сергей Владимирович", "Будайханова Айгуль Тамирлановна",
-    "Бычкова Елена Викторовна", "Вылегжанина Екатерина Александровна",
-    "Гаспарян Грачья Артурович", "Героль Дарья Олеговна",
-    "Гитинов Шамиль Магомедович", "Гурьянова Анна Владимировна",
-    "Дячук Кирилл Алексеевич", "Захарова Екатерина Алексеевна",
-    "Зиновьева Диана Наримановна", "Казарян Инна Владимировна",
-    "Мамеян Джульетта Анзоровна", "Мельникова Ольга Игоревна",
-    "Минасян Кристина Андреевна", "Оганесян Тигран Сергеевич",
-    "Петросян Гаянэ Борисовна", "Петросян Грант Эрикович",
-    "Раблюк Анна", "Роскошная Валерия Витальевна",
-    "Спивак Екатерина Алексеевна", "Татулян Анна Робертовна",
-    "Широков Игорь Валентинович", "Ягафаров Наиль Фанилевич",
-    "Якунина Александра Александровна",
+    'Петросян Гаянэ Борисовна',
+    'Казарян Инна Владимировна',
+    'Дячук Кирилл Алексеевич',
+    'Ягафаров Наиль Фанилевич',
+    'Спивак Екатерина Алексеевна',
+    'Минасян Кристина Андреевна',
+    'Зиновьева Диана Наримановна',
+    'Бычкова Елена Викторовна',
+    'Гитинов Шамиль Магомедович',
+    'Широков Игорь Валентинович',
+    'Мамеян Джульетта Анзоровна',
+    'Оганесян Тигран Сергеевич',
+    'Роскошная Валерия Витальевна',
+    'Героль Дарья Олеговна',
+    'Захарова Екатерина Алексеевна',
+    'Петросян Грант Эрикович',
+    'Гурьянова Анна Владимировна',
+    'Вылегжанина Екатерина Александровна',
+    'Калайджян Анна Робертовна',
 ]
 DOCTORS_PER_PAGE = 5
-PROMOTIONS_FILE = Path(__file__).resolve().parent / "web" / "assets" / "promotions.json"
-
-
-def load_promotions() -> list[Dict[str, Any]]:
-    """Read patient-facing promotion data supplied by the clinic."""
-    try:
-        with PROMOTIONS_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [p for p in data if isinstance(p, dict) and p.get("id") and p.get("title")]
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.error("Не удалось загрузить файл акций %s: %s", PROMOTIONS_FILE, exc)
-        return []
-
-
-def find_promotion(promotion_id: str | int) -> Optional[Dict[str, Any]]:
-    return next((p for p in load_promotions() if str(p.get("id")) == str(promotion_id)), None)
-
 SERVICES = [
     "Консультация", "ПРОФ гигиена", "Лечение кариеса", "Удаление зуба",
     "Имплантация", "Протезирование", "Ортодонтия (брекеты, элайнеры)",
     "Гнатология / ВНЧС", "Диагностика (КЛКТ)",
 ]
-PROBLEMS = ["Болит зуб", "Отёк, воспаление", "Скол зуба", "Выпала коронка", "Ребёнку нужна помощь", "Не знаю, что нужно"]
+PROBLEMS = ["Болит зуб", "Отёк, воспаление", "Скол зуба", "Выпала коронка / мост", "Ребёнку нужна помощь", "Не знаю, что нужно"]
 EMERGENCY_PROBLEMS = ["Острая боль", "Отёк", "Скол зуба", "Выпала коронка", "Ребёнку больно", "Нужен срочный звонок"]
 
 
@@ -225,35 +210,23 @@ def create_support_task(user_id: int, subject: str, description: str, priority: 
     return result
 
 
-def create_appointment_lead(
-    user_id: int,
-    appointment: Dict[str, Any],
-    channel: str = "Telegram",
-    session_user_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Create a CRM request from Telegram or MAX without claiming an MIS booking."""
-    session_key = session_user_id if session_user_id is not None else user_id
-    user = user_sessions.get(session_key, {})
-    channel = (channel or "Telegram").strip()[:40]
-    channel_tag = "MAX" if channel.lower().startswith("max") else "БОТ"
+def create_appointment_lead(user_id: int, appointment: Dict[str, Any]) -> Dict[str, Any]:
+    user = user_sessions.get(user_id, {})
     description = (
         f"Пациент: {user.get('name', 'Пациент')}\nТелефон: {user.get('phone') or 'не указан'}\n"
-        f"ID пользователя {channel}: {user_id}\nКанал: {channel} Mini App\n"
+        f"Telegram ID: {user_id}\nСпособ записи: заявка из Telegram-бота\n"
         f"Проблема: {appointment.get('problem') or 'не указана'}\n"
         f"Услуга: {appointment.get('service') or 'не указана'}\n"
-        f"Врач (пожелание): {appointment.get('doctor') or 'не выбран'}\n"
+        f"Врач: {appointment.get('doctor') or 'не выбран'}\n"
         f"Предпочтительная дата: {appointment.get('date') or 'не указана'}\n"
         f"Предпочтительное время: {appointment.get('time') or 'не указано'}\n"
-        f"Акция: {appointment.get('promotion') or 'не выбрана'}\n"
-        "Важно: это заявка; свободный слот не забронирован. Администратор должен подтвердить время."
+        "Важно: слот не забронирован; требуется подтверждение администратора."
     )
-    title = (f"[{channel_tag}] Заявка по акции: {appointment.get('promotion')}" if appointment.get('promotion') else
-             f"[{channel_tag}] Заявка на приём: {appointment.get('service') or 'консультация'}")
-    assigned_by_id = int(os.getenv("BITRIX_ASSIGNED_BY_ID", "33"))
+    title = f"[БОТ] Заявка на приём: {appointment.get('service') or 'консультация'}"
     result = bitrix_call("crm.item.add", {"entityTypeId": 1, "fields": {
         "title": title[:255], "name": user.get("name", "Пациент"),
-        "comments": description, "sourceId": "WEB", "assignedById": assigned_by_id,
-        "OPENED": "Y", "observers": BITRIX_ADMIN_IDS,
+        "comments": description, "sourceId": "WEB", "assignedById": 33,
+        "OPENED": "Y", "observers": ADMIN_IDS,
     }})
     lead_id = result.get("result", {}).get("item", {}).get("id")
     if lead_id and user.get("phone"):
@@ -261,8 +234,7 @@ def create_appointment_lead(
             "fm": [{"typeId": "PHONE", "valueType": "WORK", "value": user["phone"]}]
         }})
     if not lead_id:
-        save_pending_request({"type": title, "user_id": user_id, "channel": channel,
-                              "description": description, "phone": user.get("phone")})
+        save_pending_request({"type": "Заявка на приём", "user_id": user_id, "description": description})
     return result
 
 
@@ -323,9 +295,8 @@ async def start_auth(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         "Для просмотра услуг, врачей и формы заявки можно открыть Mini App.", context, markup)
 
 
-async def show_appointment_entry(user_id: int, context: ContextTypes.DEFAULT_TYPE, preserve: bool = False):
-    if not preserve:
-        user_sessions[user_id]["appointment"] = {}
+async def show_appointment_entry(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    user_sessions[user_id]["appointment"] = {}
     user_sessions[user_id]["step"] = "appointment_entry"
     await send(user_id, "<b>Запись на приём</b>\nВыберите удобный способ:", context, keyboard([
         [("🦷 По проблеме", "book_by_problem")],
@@ -373,7 +344,7 @@ async def show_doctors(user_id: int, context: ContextTypes.DEFAULT_TYPE, page: i
     rows.append([("⬅️ Назад в запись" if appointment_flow else "⬅️ В главное меню", "appointment" if appointment_flow else "back_menu")])
     user_sessions[user_id]["step"] = "choose_doctor" if appointment_flow else user_sessions[user_id].get("step")
     text = ("<b>Выберите врача</b>\n\n" if appointment_flow else "<b>Наши специалисты</b>\n\n")
-    text += "Для уточнения специализации и доступного времени обратитесь к администратору клиники."
+    text += "Список врачей из текущего файла бота. Подробные карточки, фото, стаж, услуги и ближайшие окна требуют сверки с данными клиники."
     await send(user_id, text, context, keyboard(rows))
 
 
@@ -412,57 +383,12 @@ async def show_about(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_promotions(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    promotions = load_promotions()
-    if not promotions:
-        await send(user_id,
-            "<b>Акции и предложения</b> 🎁\n\nСписок предложений временно недоступен. Уточните действующие условия у администратора.",
-            context, keyboard([[ ("💬 Написать администратору", "support") ], [("⬅️ В главное меню", "back_menu")]]))
-        return
-    rows = [[(f"{i + 1}. {p['title'][:48]}", f"promo_view_{p['id']}")] for i, p in enumerate(promotions)]
-    rows += [[("💬 Уточнить условия", "support")], [("🦷 Записаться", "appointment")], [("⬅️ В главное меню", "back_menu")]]
+    # Не добавляем не подтверждённые скидки/сроки из макетов как действующие акции.
     await send(user_id,
-        "<b>Акции и предложения «Альфа-Дент»</b> 🎁\n\n"
-        "Выберите предложение, чтобы посмотреть подробности и оставить заявку.\n\n"
-        "Важно: в файле клиники не для всех предложений указаны сроки и ограничения. Перед оформлением администратор подтвердит актуальность и применимость акции.",
-        context, keyboard(rows))
-
-
-async def show_promotion_detail(user_id: int, context: ContextTypes.DEFAULT_TYPE, promotion_id: str):
-    p = find_promotion(promotion_id)
-    if not p:
-        await send(user_id, "Акция не найдена. Вернитесь к списку предложений.", context,
-                   keyboard([[ ("⬅️ Все акции", "promo") ]]))
-        return
-    parts = [f"<b>{esc(p.get('title'))}</b>"]
-    if p.get("price"):
-        parts.append(f"<b>Цена / условие:</b> {esc(p.get('price'))}")
-    if p.get("summary"):
-        parts.append(esc(p.get("summary")))
-    if p.get("doctors"):
-        parts.append("<b>Врачи:</b> " + esc(", ".join(p.get("doctors", []))))
-    if p.get("conditions"):
-        parts.append("<b>Условия:</b> " + esc(p.get("conditions")))
-    rows = [[("🦷 Записаться по акции", f"promo_book_{p['id']}")]]
-    if p.get("more_url", "").startswith("https://"):
-        rows.append([("🔎 Подробнее на сайте", "unused", p["more_url"])])
-    rows += [[("⬅️ К списку акций", "promo")], [("💬 Уточнить у администратора", "support")]]
-    await send(user_id, "\n\n".join(parts), context, keyboard(rows))
-
-
-async def start_promotion_booking(user_id: int, context: ContextTypes.DEFAULT_TYPE, promotion_id: str):
-    p = find_promotion(promotion_id)
-    if not p:
-        await send(user_id, "Не удалось найти акцию. Откройте раздел акций ещё раз.", context,
-                   keyboard([[ ("🎁 Все акции", "promo") ]]))
-        return
-    user = session_for(user_id)
-    user["appointment"] = {
-        "promotion": p.get("title", ""),
-        "promotion_id": str(p.get("id", "")),
-        "service": p.get("service", "") or "",
-        "mode": "promotion",
-    }
-    await show_appointment_entry(user_id, context, preserve=True)
+        "<b>Акции и предложения</b> 🎁\n\nАктуальные предложения и сроки действия нужно подтвердить у клиники. "
+        "Напишите администратору — он сообщит действующие условия.", context, keyboard([
+            [("💬 Уточнить акции", "support")], [("🦷 Записаться", "appointment")], [("⬅️ В главное меню", "back_menu")]
+        ]))
 
 
 async def show_reviews(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -488,14 +414,16 @@ async def show_referral(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_my_visits(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    # Не отображаем визиты, пока их нельзя достоверно получить из МИС.
+    # Не показываем фальшивые визиты: текущий проект не подключён к МИС Инфоклиника.
     await send(user_id,
-        "<b>Мои визиты</b> 📅\n\nЧтобы получить информацию о ваших визитах или уточнить изменения, отправьте запрос администратору клиники.",
+        "<b>Мои визиты</b> 📅\n\nПолучение реальных визитов из МИС пока не подключено. "
+        "Я не буду показывать тестовые записи как настоящие. Вы можете отправить запрос администратору.",
         context, keyboard([
             [("📨 Запросить информацию о визитах", "visits_request")],
             [("🦷 Оставить заявку на приём", "appointment")],
             [("⬅️ В главное меню", "back_menu")],
         ]))
+
 
 async def begin_support(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id]["step"] = "waiting_support"
@@ -507,25 +435,17 @@ async def begin_support(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 async def begin_booking(user_id: int, context: ContextTypes.DEFAULT_TYPE, mode: str):
     appt = user_sessions[user_id].setdefault("appointment", {})
-    carry = {k: appt.get(k) for k in ("promotion", "promotion_id", "service") if appt.get(k)}
     appt.clear()
-    appt.update(carry)
     appt["mode"] = mode
     if mode == "problem":
         await show_problem_choices(user_id, context)
     elif mode == "service":
-        if appt.get("service"):
-            await show_booking_doctor_step(user_id, context)
-        else:
-            await show_services(user_id, context, appointment_flow=True)
+        await show_services(user_id, context, appointment_flow=True)
     elif mode == "doctor":
         await show_doctors(user_id, context, 0, appointment_flow=True)
     else:
         appt["problem"] = "Запись на ближайшее время"
-        if appt.get("service"):
-            await show_booking_doctor_step(user_id, context)
-        else:
-            await show_services(user_id, context, appointment_flow=True)
+        await show_services(user_id, context, appointment_flow=True)
 
 
 async def show_booking_doctor_step(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -568,7 +488,6 @@ async def show_booking_confirmation(user_id: int, context: ContextTypes.DEFAULT_
         f"Врач: {esc(a.get('doctor') or 'не выбран')}\n"
         f"Желаемая дата: {esc(a.get('date') or 'не указана')}\n"
         f"Желаемое время: {esc(a.get('time') or 'не важно')}\n"
-        f"Акция: {esc(a.get('promotion') or 'не выбрана')}\n"
         f"Имя: {esc(user_sessions[user_id].get('name') or 'не указано')}\n"
         f"Телефон: {esc(user_sessions[user_id].get('phone') or 'не указан')}\n\n"
         "После отправки администратор проверит доступность и подтвердит запись."
@@ -613,40 +532,44 @@ async def process_phone(user_id: int, raw_phone: str, context: ContextTypes.DEFA
         await send(user_id, "Не удалось распознать номер. Введите российский номер из 10 цифр после +7 или 8.", context)
         return
     user_sessions[user_id]["phone"] = "+7" + phone
-    user_sessions[user_id]["step"] = "waiting_code"
-    await send(
-        user_id,
-        "Номер принят. Для подтверждения введите текущий код <code>1234</code>. "
-        "Автоматическая отправка SMS ещё не настроена.",
-        context,
-    )
+    if AUTH_MODE == "demo":
+        user_sessions[user_id]["step"] = "waiting_code"
+        await send(user_id,
+            "⚠️ <b>Тестовый режим авторизации.</b> SMS-провайдер не подключён. "
+            f"Для теста введите код <code>{esc(DEMO_OTP_CODE)}</code>. Этот режим нельзя использовать для реальной идентификации пациентов.", context)
+    else:
+        user_sessions[user_id]["step"] = "waiting_sms_setup"
+        await send(user_id,
+            "Номер принят. Проверка по SMS ещё не подключена к проекту, поэтому авторизация не завершена. "
+            f"Пожалуйста, свяжитесь с клиникой: {esc(CLINIC_PHONE)}.", context,
+            keyboard([[("Связаться с администратором", "support")], [("Начать заново", "restart_auth")]]))
+
 
 async def process_code(user_id: int, code: str, context: ContextTypes.DEFAULT_TYPE):
-    user = user_sessions[user_id]
-    if code.strip() != OTP_CODE:
-        await send(user_id, "Неверный код. Попробуйте ещё раз.", context)
-        return
-    user["auth"] = True
-    user["step"] = None
-    await send(user_id, "Номер подтверждён.", context)
-    after_auth = user.pop("after_auth", "menu")
-    if after_auth == "promo_book":
-        promotion_id = str(user.pop("pending_promotion_id", ""))
-        await start_promotion_booking(user_id, context, promotion_id)
-    elif after_auth == "appointment":
-        await show_appointment_entry(user_id, context)
-    elif after_auth == "my_visits":
-        await show_my_visits(user_id, context)
-    else:
+    if AUTH_MODE == "demo" and code.strip() == DEMO_OTP_CODE:
+        user_sessions[user_id]["auth"] = True
+        user_sessions[user_id]["step"] = None
+        await send(user_id, "✅ Тестовая авторизация пройдена. Реальная проверка номера через SMS ещё не подключена.", context)
         await send_main_menu(user_id, context)
+    else:
+        await send(user_id, "Неверный код. Попробуйте ещё раз или начните авторизацию заново командой /start.", context)
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
     user = session_for(tg_user.id, tg_user.first_name or "Пациент")
+    # Поддерживаем реферальный deep-link без обещания/начисления не согласованных бонусов.
     if context.args and context.args[0].startswith("ref_"):
         user["referrer_id"] = context.args[0][4:]
         logger.info("Referral start: user_id=%s referrer=%s", tg_user.id, user["referrer_id"])
-    await send_main_menu(tg_user.id, context)
+    if user.get("auth"):
+        await send_main_menu(tg_user.id, context)
+    else:
+        await send(tg_user.id,
+            "👋 <b>Добро пожаловать в «АльфаДент»!</b>\n\nДля продолжения пройдите авторизацию. "
+            "Доступ к разделам личного кабинета появится после подтверждения номера.", context)
+        await start_auth(tg_user.id, context)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message or not update.message.text:
@@ -674,6 +597,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_phone(user_id, text, context); return
     if state == "waiting_code":
         await process_code(user_id, text, context); return
+    if state == "waiting_sms_setup":
+        await send(user_id, "Для завершения авторизации подключите SMS/OTP-провайдера или обратитесь в клинику.", context); return
+    if not user.get("auth"):
+        await send(user_id, "Для продолжения нажмите /start и пройдите авторизацию.", context); return
     if state == "waiting_support":
         result = create_support_task(user_id, "Вопрос пациента", text, priority=1)
         task_id = result.get("result", {}).get("task", {}).get("id")
@@ -698,20 +625,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.from_user.id
     user = session_for(user_id, query.from_user.first_name or "Пациент")
     data = query.data or ""
-    if data.startswith("promo_book_") and not user.get("auth"):
-        user["pending_promotion_id"] = data.rsplit("_", 1)[-1]
-        user["after_auth"] = "promo_book"
-        await start_auth(user_id, context)
-        return
-    auth_required = (
-        data in {"appointment", "my_visits", "visits_request", "booking_submit"}
-        or data.startswith(("book_by_", "problem_", "doc_", "date_", "time_", "select_service_"))
-        or re.fullmatch(r"svc_\d+", data) is not None
-        or data in {"back_service", "back_date"}
-    )
-    if auth_required and not user.get("auth"):
-        user["after_auth"] = "my_visits" if data in {"my_visits", "visits_request"} else "appointment"
-        await start_auth(user_id, context)
+    if not user.get("auth"):
+        await send(user_id, "Для продолжения нажмите /start и пройдите авторизацию.", context)
         return
 
     if data == "webapp_help":
@@ -769,10 +684,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await show_services(user_id, context); return
     if data == "promo":
         await show_promotions(user_id, context); return
-    if data.startswith("promo_view_"):
-        await show_promotion_detail(user_id, context, data.rsplit("_", 1)[-1]); return
-    if data.startswith("promo_book_"):
-        await start_promotion_booking(user_id, context, data.rsplit("_", 1)[-1]); return
     if data == "about":
         await show_about(user_id, context); return
     if data == "reviews":
@@ -802,9 +713,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             keyboard([[("🦷 Записаться на услугу", f"select_service_{idx}")], [("⬅️ К услугам", "services")], [("🏠 В меню", "back_menu")]])); return
     if data.startswith("select_service_"):
         idx = int(data.rsplit("_", 1)[1])
-        previous = user.get("appointment", {})
-        carry = {k: previous.get(k) for k in ("promotion", "promotion_id") if previous.get(k)}
-        user["appointment"] = {"service": SERVICES[idx], "mode": "service", **carry}
+        user["appointment"] = {"service": SERVICES[idx], "mode": "service"}
         await show_booking_doctor_step(user_id, context)
         return
     if data.startswith("svc_"):
@@ -848,23 +757,15 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def main():
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN.startswith("PASTE_NEW_"):
-        raise RuntimeError("Укажите новый TELEGRAM_TOKEN в этом файле (или через переменную окружения). Старый токен был раскрыт и должен быть заменён.")
-    if not BITRIX24_WEBHOOK:
-        logger.warning("BITRIX24_WEBHOOK не настроен: заявки не смогут попасть в Bitrix24.")
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Не задан TELEGRAM_TOKEN. Установите переменную окружения перед запуском.")
+    if not BITRIX24_WEBHOOK_RAW:
+        logger.warning("BITRIX24_WEBHOOK не задан: обращения в Bitrix24 не будут создаваться.")
     if not WEBAPP_URL.startswith("https://"):
         logger.warning("WEBAPP_URL не задан или не HTTPS: кнопка Mini App останется информационной.")
-    if (not TELEGRAM_PROXY.startswith(("socks5://", "socks5h://"))
-            or "LOGIN:PASSWORD@IP:PORT" in TELEGRAM_PROXY
-            or "@IP:PORT" in TELEGRAM_PROXY):
-        raise RuntimeError("Укажите новые действующие SOCKS5-данные в TELEGRAM_PROXY перед запуском.")
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .proxy(TELEGRAM_PROXY)
-        .get_updates_proxy(TELEGRAM_PROXY)
-        .build()
-    )
+    if AUTH_MODE == "demo":
+        logger.warning("ВНИМАНИЕ: включён DEMO-режим авторизации. Не использовать для реальных пациентов.")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(callback_query_handler))
