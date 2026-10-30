@@ -101,9 +101,9 @@ def env_int(name: str, default: int) -> int:
 
 MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru").strip().rstrip("/")
 MAX_API = MAX_API_BASE
-TOKEN = os.getenv("MAX_BOT_TOKEN", "")
+TOKEN = os.getenv("MAX_BOT_TOKEN", "f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx")
 MAX_BOT_TOKEN = TOKEN.strip()
-BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK", "").strip().rstrip("/")
+BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK", "https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/").strip().rstrip("/")
 BITRIX_ASSIGNED_BY_ID = env_int("BITRIX_ASSIGNED_BY_ID", 33)
 BITRIX_OBSERVER_IDS = parse_int_list(os.getenv("BITRIX_OBSERVER_IDS", ""))
 MAX_ADMIN_IDS = parse_int_list(os.getenv("MAX_ADMIN_IDS", "15,33,35,37,39,727,7821"))
