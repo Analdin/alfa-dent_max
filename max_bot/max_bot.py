@@ -1032,8 +1032,14 @@ def dispatch_callback(user_id: int, data: str) -> None:
         rows.extend([[callback("🦷 Записаться", "appointment")], [callback("⬅️ Главное меню", "back_to_menu")]])
         send_message(user_id, text, rows)
     elif data == "reviews":
-        rows = [[link_button("⭐ Яндекс Карты", YANDEX_MAPS_URL)], [link_button("⭐ ПроДокторов", "https://prodoctorov.ru/sochi/alfadent/")], [link_button("⭐ 2ГИС", "https://2gis.ru/sochi/firm/alfadent/reviews")], [callback("⬅️ Главное меню", "back_to_menu")]]
-        send_message(user_id, "⭐ Отзывы\n\nПроверьте актуальность страниц перед публикацией.", rows)
+        rows = [
+            [link_button("🌐 Официальные отзывы клиники", "https://alfadentstom.ru/reviews/")],
+            [link_button("⭐ Яндекс Карты", YANDEX_MAPS_URL)],
+            [link_button("⭐ ПроДокторов", "https://prodoctorov.ru/sochi/lpu/56511-stomatologiya-alfa-dent/")],
+            [link_button("⭐ 2ГИС", "https://2gis.ru/sochi/firm/70000001006981643")],
+            [callback("⬅️ Главное меню", "back_to_menu")],
+        ]
+        send_message(user_id, "⭐ Отзывы\n\nОтзывы клиники и внешние площадки.", rows)
     elif data == "referral":
         profile_url = max_bot_profile_url()
         if profile_url:
