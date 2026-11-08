@@ -65,7 +65,7 @@ except ZoneInfoNotFoundError:
     CLINIC_TZ = ZoneInfo("Europe/Moscow")
     CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("MAX_DATA_DIR", str(BASE_DIR / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 if os.name == "posix":
     try:
