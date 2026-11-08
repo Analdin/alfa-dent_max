@@ -1362,7 +1362,8 @@ def main() -> None:
         raise RuntimeError("Не установлен Waitress. Выполните: .venv/bin/pip install waitress") from exc
 
     start_webhook_worker()
-    host = "0.0.0.0"
+    # The Flask/Waitress service is private; Nginx is the only public entry point.
+    host = "127.0.0.1"
     port = 5000
     if not 1 <= port <= 65535:
         raise RuntimeError("API_PORT должен находиться в диапазоне 1–65535.")
