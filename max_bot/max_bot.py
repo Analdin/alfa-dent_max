@@ -65,7 +65,7 @@ except ZoneInfoNotFoundError:
     CLINIC_TZ = ZoneInfo("Europe/Moscow")
     CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("MAX_DATA_DIR", str(BASE_DIR / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 if os.name == "posix":
     try:
@@ -542,9 +542,32 @@ def send_main_menu(user_id: int) -> None:
     send_message(user_id, f"{greeting}\n\nЯ чат-бот стоматологической клиники «Альфа-Дент».\n\n📍 {CLINIC_ADDRESS}\n🕘 {CLINIC_HOURS}\n📞 {CLINIC_PHONE}\n\nПодробные карточки услуг, врачей и акции доступны в приложении клиники.", rows)
 
 
+def validate_auth_session(user_id: int, user: dict[str, Any]) -> bool:
+    token = str(user.get("access_token") or "")
+    if not token:
+        user["auth"] = False
+        return False
+    try:
+        response = requests.get(
+            f"{AUTH_API_URL}/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        data = response.json()
+        valid = response.ok and bool(data.get("authorized"))
+    except (requests.RequestException, ValueError):
+        logger.exception("Не удалось проверить серверную сессию MAX")
+        return False
+    if not valid:
+        user["auth"] = False
+        user.pop("access_token", None)
+        persist_session(user_id)
+    return valid
+
+
 def require_auth(user_id: int, action: str) -> bool:
     user = session_for(user_id)
-    if user.get("auth"):
+    if user.get("auth") and validate_auth_session(user_id, user):
         return True
     user["auth"] = False
     user["pending_action"] = action
@@ -626,7 +649,9 @@ def process_phone(user_id: int, text: str) -> None:
     try:
         response=requests.post(f"{AUTH_API_URL}/api/auth/register",json={"platform":"max","phone":user["phone"],"name":user.get("name","")},headers={"X-Internal-Auth":AUTH_API_SECRET},timeout=10)
         if response.status_code==200:
-            data=response.json();user["auth"]=True;user["auth_until"]=0;user["step"]=None;persist_session(user_id)
+            data=response.json()
+            user["access_token"]=data["access_token"]
+            user["auth"]=True;user["auth_until"]=0;user["step"]=None;persist_session(user_id)
             send_message(user_id,"✅ Аккаунт создан. Ваш постоянный пароль — сохраните его, повторно он не будет показан:\n\n"+data["password"]+"\n\nНе передавайте пароль другим людям.")
             dispatch_after_auth(user_id);return
         if response.status_code==409:
@@ -643,6 +668,7 @@ def process_password(user_id: int, text: str) -> None:
         response=requests.post(f"{AUTH_API_URL}/api/auth/login",json={"platform":"max","phone":user.get("phone",""),"password":text},headers={"X-Internal-Auth":AUTH_API_SECRET},timeout=10)
         data=response.json()
         if response.ok and data.get("authorized"):
+            user["access_token"]=data["access_token"]
             user["auth"]=True;user["auth_until"]=0;user["step"]=None;persist_session(user_id)
             send_message(user_id,"✅ Вход выполнен.");dispatch_after_auth(user_id)
         else: send_message(user_id,data.get("detail","Неверный пароль."))
@@ -888,6 +914,11 @@ def handle_text(user_id: int, text: str) -> None:
         return
     if state == "waiting_password":
         process_password(user_id, text)
+        return
+    if user.get("auth") and not validate_auth_session(user_id, user):
+        send_message(user_id, "Сессия завершена. Снова войдите по телефону и постоянному паролю.")
+        user["step"] = "waiting_phone"
+        persist_session(user_id)
         return
     if state == "waiting_support":
         user["step"] = None
@@ -1331,7 +1362,8 @@ def main() -> None:
         raise RuntimeError("Не установлен Waitress. Выполните: .venv/bin/pip install waitress") from exc
 
     start_webhook_worker()
-    host = "0.0.0.0"
+    # The Flask/Waitress service is private; Nginx is the only public entry point.
+    host = "127.0.0.1"
     port = 5000
     if not 1 <= port <= 65535:
         raise RuntimeError("API_PORT должен находиться в диапазоне 1–65535.")
