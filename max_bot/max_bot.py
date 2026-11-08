@@ -542,7 +542,7 @@ def send_main_menu(user_id: int) -> None:
     send_message(user_id, f"{greeting}\n\nЯ чат-бот стоматологической клиники «Альфа-Дент».\n\n📍 {CLINIC_ADDRESS}\n🕘 {CLINIC_HOURS}\n📞 {CLINIC_PHONE}\n\nПодробные карточки услуг, врачей и акции доступны в приложении клиники.", rows)
 
 
-def validate_auth_session(user: dict[str, Any]) -> bool:
+def validate_auth_session(user_id: int, user: dict[str, Any]) -> bool:
     token = str(user.get("access_token") or "")
     if not token:
         user["auth"] = False
@@ -561,13 +561,13 @@ def validate_auth_session(user: dict[str, Any]) -> bool:
     if not valid:
         user["auth"] = False
         user.pop("access_token", None)
-        persist_session(next((uid for uid, payload in user_sessions.items() if payload is user), 0))
+        persist_session(user_id)
     return valid
 
 
 def require_auth(user_id: int, action: str) -> bool:
     user = session_for(user_id)
-    if user.get("auth") and validate_auth_session(user):
+    if user.get("auth") and validate_auth_session(user_id, user):
         return True
     user["auth"] = False
     user["pending_action"] = action
@@ -915,7 +915,7 @@ def handle_text(user_id: int, text: str) -> None:
     if state == "waiting_password":
         process_password(user_id, text)
         return
-    if user.get("auth") and not validate_auth_session(user):
+    if user.get("auth") and not validate_auth_session(user_id, user):
         send_message(user_id, "Сессия завершена. Снова войдите по телефону и постоянному паролю.")
         user["step"] = "waiting_phone"
         persist_session(user_id)
