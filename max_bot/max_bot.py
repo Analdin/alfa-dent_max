@@ -33,9 +33,9 @@ BASE_DIR = Path(__file__).resolve().parent
 # .env не используется: основные ключи и параметры находятся непосредственно в этом файле.
 MAX_API_BASE = "https://platform-api2.max.ru"
 MAX_API = MAX_API_BASE
-TOKEN = "f9LHodD0cOKi_QdXn3Y_X9xWn9U-KQpNwlQfWqJ47fZL0Hr71E9I9bOt7-R_Lfq0J_0y_AHKpVw-QMkhasZx"
+TOKEN = os.getenv("MAX_BOT_TOKEN", "").strip()
 MAX_BOT_TOKEN = TOKEN
-BITRIX24_WEBHOOK = "https://alfadent23.bitrix24.ru/rest/11599/tleyme67jjk7x2gf/"
+BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK", "").strip()
 BITRIX_ASSIGNED_BY_ID = 33
 BITRIX_OBSERVER_IDS = []
 MAX_ADMIN_IDS = [15, 33, 35, 37, 39, 727, 7821]
@@ -43,19 +43,20 @@ ADMIN_IDS = MAX_ADMIN_IDS
 # В старом исходнике соответствие MAX ID -> Bitrix ID не задавалось.
 MAX_TO_BITRIX_ADMIN_MAP = {}
 
-OTP_CODE = "1234"
-MAX_MINIAPP_LINK = "https://alfadent-miniapp.onrender.com/miniapp.html"
+AUTH_API_URL = os.getenv("AUTH_API_URL", "http://127.0.0.1:8001").rstrip("/")
+AUTH_API_SECRET = os.getenv("INTERNAL_AUTH_SECRET", "").strip()
+MAX_MINIAPP_LINK = os.getenv("MAX_MINIAPP_LINK", "https://YOUR_DOMAIN/miniapp.html").strip()
 MAX_BOT_USERNAME = ""
 MAX_BOT_CONTACT_ID = None
 # В старом исходнике секрет webhook не был задан; обязательная проверка отключена.
-MAX_WEBHOOK_SECRET = ""
-MAX_REQUIRE_WEBHOOK_SECRET = False
+MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
+MAX_REQUIRE_WEBHOOK_SECRET = os.getenv("MAX_REQUIRE_WEBHOOK_SECRET", "true").lower() in ("1", "true", "yes")
 
 CLINIC_PHONE = "+7 (988) 233-77-25"
 CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски»."
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
 YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
-PROMOTIONS_URL = "https://alfadent-miniapp.onrender.com/assets/promotions.json"
+PROMOTIONS_URL = os.getenv("PROMOTIONS_URL", "https://YOUR_DOMAIN/assets/promotions.json").strip()
 PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
 CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 try:
@@ -543,13 +544,12 @@ def send_main_menu(user_id: int) -> None:
 
 def require_auth(user_id: int, action: str) -> bool:
     user = session_for(user_id)
-    auth_until = float(user.get("auth_until") or 0)
-    if user.get("auth") and auth_until > time.time():
+    if user.get("auth"):
         return True
     user["auth"] = False
     user["pending_action"] = action
     user["step"] = "waiting_phone"
-    send_message(user_id, "🔐 Для этой функции нужно подтвердить номер телефона.\n\nВведите российский номер, например +7 988 233-77-25.\nSMS-провайдер пока не подключён: после номера будет предложен временный код 1234.", [[callback("⬅️ Главное меню", "back_to_menu")]])
+    send_message(user_id, "🔐 Для доступа введите номер телефона. При первой регистрации будет создан постоянный пароль; при следующих входах понадобится этот пароль.", [[callback("⬅️ Главное меню", "back_to_menu")]])
     return False
 
 
@@ -618,26 +618,36 @@ def process_phone(user_id: int, text: str) -> None:
     if not phone:
         send_message(user_id, "Не удалось распознать номер. Введите российский номер в формате +7 988 233-77-25.")
         return
-    user = session_for(user_id)
-    user["phone"] = "+7" + phone
+    user = session_for(user_id); user["phone"] = "+7" + phone
     client = find_client_in_bitrix(user["phone"])
     if client.get("found"):
-        user["bitrix_id"] = client.get("id")
-        user["bitrix_type"] = client.get("type")
+        user["bitrix_id"] = client.get("id"); user["bitrix_type"] = client.get("type")
         user["name"] = client.get("name") or user.get("name") or "Пациент"
-    user["step"] = "waiting_code"
-    send_message(user_id, f"Номер принят. SMS фактически не отправляется: SMS-провайдер не подключён.\n\nВведите временный код: {OTP_CODE}")
+    try:
+        response=requests.post(f"{AUTH_API_URL}/api/auth/register",json={"platform":"max","phone":user["phone"],"name":user.get("name","")},headers={"X-Internal-Auth":AUTH_API_SECRET},timeout=10)
+        if response.status_code==200:
+            data=response.json();user["auth"]=True;user["auth_until"]=0;user["step"]=None;persist_session(user_id)
+            send_message(user_id,"✅ Аккаунт создан. Ваш постоянный пароль — сохраните его, повторно он не будет показан:\n\n"+data["password"]+"\n\nНе передавайте пароль другим людям.")
+            dispatch_after_auth(user_id);return
+        if response.status_code==409:
+            user["step"]="waiting_password";persist_session(user_id)
+            send_message(user_id,"Для этого номера уже существует аккаунт. Введите постоянный пароль.");return
+        raise RuntimeError(response.json().get("detail","Сервис авторизации недоступен"))
+    except Exception as exc:
+        logger.exception("Auth register failed MAX")
+        send_message(user_id,"Не удалось создать аккаунт: "+str(exc)+". Попробуйте позже.")
 
-def process_code(user_id: int, text: str) -> None:
-    user = session_for(user_id)
-    if text.strip() != OTP_CODE:
-        send_message(user_id, "Неверный временный код. Попробуйте ещё раз.")
-        return
-    user["auth"] = True
-    user["auth_until"] = time.time() + 24 * 60 * 60
-    user["step"] = None
-    send_message(user_id, "✅ Временное подтверждение выполнено. Реальная SMS-проверка не подключена; тестовый доступ действует 24 часа.")
-    dispatch_after_auth(user_id)
+def process_password(user_id: int, text: str) -> None:
+    user=session_for(user_id)
+    try:
+        response=requests.post(f"{AUTH_API_URL}/api/auth/login",json={"platform":"max","phone":user.get("phone",""),"password":text},headers={"X-Internal-Auth":AUTH_API_SECRET},timeout=10)
+        data=response.json()
+        if response.ok and data.get("authorized"):
+            user["auth"]=True;user["auth_until"]=0;user["step"]=None;persist_session(user_id)
+            send_message(user_id,"✅ Вход выполнен.");dispatch_after_auth(user_id)
+        else: send_message(user_id,data.get("detail","Неверный пароль."))
+    except Exception:
+        logger.exception("Auth login failed MAX");send_message(user_id,"Сервис авторизации временно недоступен. Попробуйте позже.")
 
 
 def show_my_visits(user_id: int) -> None:
@@ -876,8 +886,8 @@ def handle_text(user_id: int, text: str) -> None:
     if state == "waiting_phone":
         process_phone(user_id, text)
         return
-    if state == "waiting_code":
-        process_code(user_id, text)
+    if state == "waiting_password":
+        process_password(user_id, text)
         return
     if state == "waiting_support":
         user["step"] = None
@@ -1295,6 +1305,8 @@ def main() -> None:
         raise RuntimeError("MAX_API_BASE должен быть HTTPS URL.")
     if not MAX_BOT_TOKEN or not MAX_BOT_TOKEN.strip() or MAX_BOT_TOKEN.startswith("PASTE_NEW_"):
         raise RuntimeError("MAX_BOT_TOKEN не настроен. Добавьте новый токен в /etc/alfadent/max_bot.env.")
+    if not AUTH_API_SECRET:
+        raise RuntimeError("Не задан INTERNAL_AUTH_SECRET: MAX-боту нужен защищённый доступ к общему API авторизации.")
     if not BITRIX24_WEBHOOK or BITRIX24_WEBHOOK.startswith("PASTE_NEW_"):
         logger.warning("BITRIX24_WEBHOOK не настроен: обращения будут сохраняться в локальную резервную очередь.")
     if MAX_WEBHOOK_SECRET.strip() and not re.fullmatch(r"[A-Za-z0-9_-]{5,256}", MAX_WEBHOOK_SECRET.strip()):
