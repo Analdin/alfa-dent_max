@@ -29,34 +29,35 @@ from flask import Flask, jsonify, request
 BASE_DIR = Path(__file__).resolve().parent
 
 
-# Настройки восстановлены из старого рабочего исходника max_bot_alfa_dent_updated.py.
-# .env не используется: основные ключи и параметры находятся непосредственно в этом файле.
-MAX_API_BASE = "https://platform-api2.max.ru"
+# ---------------- PRIVATE PYTHON CONFIGURATION ----------------
+# alfadent_config.py is deployed from the private config repository.
+import alfadent_config as config
+
+MAX_API_BASE = config.MAX_API_BASE
 MAX_API = MAX_API_BASE
-TOKEN = os.getenv("MAX_BOT_TOKEN", "").strip()
+TOKEN = config.MAX_BOT_TOKEN.strip()
 MAX_BOT_TOKEN = TOKEN
-BITRIX24_WEBHOOK = os.getenv("BITRIX24_WEBHOOK", "").strip()
-BITRIX_ASSIGNED_BY_ID = 33
+BITRIX24_WEBHOOK = config.BITRIX24_WEBHOOK
+BITRIX_ASSIGNED_BY_ID = int(config.BITRIX_ASSIGNED_BY_ID)
 BITRIX_OBSERVER_IDS = []
 MAX_ADMIN_IDS = [15, 33, 35, 37, 39, 727, 7821]
 ADMIN_IDS = MAX_ADMIN_IDS
-# В старом исходнике соответствие MAX ID -> Bitrix ID не задавалось.
+# В исходнике соответствие MAX ID -> Bitrix ID не задавалось.
 MAX_TO_BITRIX_ADMIN_MAP = {}
 
-AUTH_API_URL = os.getenv("AUTH_API_URL", "http://127.0.0.1:8001").rstrip("/")
-AUTH_API_SECRET = os.getenv("INTERNAL_AUTH_SECRET", "").strip()
-MAX_MINIAPP_LINK = os.getenv("MAX_MINIAPP_LINK", "https://YOUR_DOMAIN/miniapp.html").strip()
+AUTH_API_URL = config.AUTH_API_URL.rstrip("/")
+AUTH_API_SECRET = config.INTERNAL_AUTH_SECRET
+MAX_MINIAPP_LINK = config.MAX_MINIAPP_LINK.strip()
 MAX_BOT_USERNAME = ""
 MAX_BOT_CONTACT_ID = None
-# В старом исходнике секрет webhook не был задан; обязательная проверка отключена.
-MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
-MAX_REQUIRE_WEBHOOK_SECRET = os.getenv("MAX_REQUIRE_WEBHOOK_SECRET", "true").lower() in ("1", "true", "yes")
+MAX_WEBHOOK_SECRET = config.MAX_WEBHOOK_SECRET.strip()
+MAX_REQUIRE_WEBHOOK_SECRET = bool(config.MAX_REQUIRE_WEBHOOK_SECRET)
 
 CLINIC_PHONE = "+7 (988) 233-77-25"
 CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 этаж. Ориентир: с торца здания, рядом с магазином «Коляски»."
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
 YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
-PROMOTIONS_URL = os.getenv("PROMOTIONS_URL", "https://YOUR_DOMAIN/assets/promotions.json").strip()
+PROMOTIONS_URL = config.PROMOTIONS_URL.strip()
 PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
 CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 try:
@@ -65,7 +66,7 @@ except ZoneInfoNotFoundError:
     CLINIC_TZ = ZoneInfo("Europe/Moscow")
     CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 
-DATA_DIR = Path(os.getenv("MAX_DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR = Path(config.MAX_DATA_DIR)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 if os.name == "posix":
     try:
@@ -75,7 +76,7 @@ if os.name == "posix":
 PENDING_FILE = DATA_DIR / "pending_requests.json"  # legacy-compatible emergency queue
 DATABASE_FILE = DATA_DIR / "max_bot.sqlite3"
 
-LOG_LEVEL = "INFO"
+LOG_LEVEL = config.LOG_LEVEL.upper()
 _file_handler = RotatingFileHandler(DATA_DIR / "max_bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
 logging.basicConfig(
     level=LOG_LEVEL,
