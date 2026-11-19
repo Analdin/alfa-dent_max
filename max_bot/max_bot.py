@@ -58,7 +58,7 @@ CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 эт�
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
 YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
 PROMOTIONS_URL = config.PROMOTIONS_URL.strip()
-PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
+PROMOTIONS_FILE = BASE_DIR.parent / "web" / "assets" / "promotions.json"
 CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 try:
     CLINIC_TZ = ZoneInfo(CLINIC_TIMEZONE_NAME)
@@ -678,7 +678,7 @@ def process_password(user_id: int, text: str) -> None:
 
 
 def show_my_visits(user_id: int) -> None:
-    send_message(user_id, "📅 Мои визиты\n\nПолучение реальных визитов из МИС «Инфоклиника» пока не подключено. Я не буду показывать фиктивные записи или имитировать подтверждение, перенос и отмену. Можно отправить запрос администратору.", [
+    send_message(user_id, "📅 Мои визиты\n\nРеальные визиты хранятся в медицинской информационной системе «Инфоклиника». Её API пока не подключено; данные CRM Bitrix24 не являются подтверждёнными визитами. Я не буду показывать фиктивные записи или имитировать подтверждение, перенос и отмену. Можно отправить запрос администратору.", [
         [callback("📨 Запросить информацию о визитах", "visits_request")],
         *miniapp_rows(),
         [callback("⬅️ Главное меню", "back_to_menu")],
@@ -728,7 +728,7 @@ def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) ->
         rows.append(nav)
     if appointment_flow:
         rows.extend([[callback("Пусть врача подберёт администратор", "book_doctor_unknown")], [callback("⬅️ К услугам", "book_change_service")]])
-        txt = "Выберите врача только как пожелание. Связь «услуга → врач» ещё не подтверждена, поэтому администратор проверит, оказывает ли выбранный специалист эту услугу. Можно поручить подбор администратору."
+        txt = "Выберите врача\n\nЧтобы записаться к врачу — нажмите на его карточку."
     else:
         rows.extend(miniapp_rows("Карточки врачей в Mini App"))
         rows.append([callback("⬅️ Главное меню", "back_to_menu")])
@@ -824,8 +824,9 @@ def show_promotions(user_id: int) -> None:
         return
     rows = [[callback(f"🎁 {p.get('title','Акция')} · {p.get('price','')}", f"promo_open_{p.get('id')}")] for p in promos]
     rows.extend(miniapp_rows("Открыть акции в Mini App"))
+    rows.append([callback("💬 Уточнить конкретный вопрос по акции", "support")])
     rows.append([callback("⬅️ Главное меню", "back_to_menu")])
-    send_message(user_id, "🎁 Акции и предложения\n\nСписок загружается из файла существующего Mini App. Сроки части предложений в исходной таблице не указаны; перед записью администратор подтвердит актуальность условий.", rows)
+    send_message(user_id, "🎁 Акции и предложения\n\nВыберите предложение, чтобы посмотреть описание, стоимость и условия. Актуальность условий подтвердит администратор.", rows)
 
 
 def show_promotion_detail(user_id: int, promo_id: str) -> None:
@@ -838,6 +839,7 @@ def show_promotion_detail(user_id: int, promo_id: str) -> None:
             f"{promo.get('summary','')}\n\nУсловия и ограничения: {promo.get('conditions','Уточнить у администратора')}\n\n"
             f"Врачи: {doctors}\n\nАктуальность и применимость предложения подтвердит администратор.")
     rows = [[callback("🦷 Записаться по акции", f"promo_book_{promo.get('id')}")],
+            [callback("💬 Уточнить вопрос по этой акции", f"promo_question_{promo.get('id')}")],
             [callback("⬅️ К акциям", "promo")]]
     if str(promo.get("more_url", "")).startswith("https://"):
         rows.insert(1, [link_button("Подробнее об акции", promo["more_url"])])
@@ -877,9 +879,12 @@ def submit_emergency(user_id: int) -> None:
     send_message(user_id, "🚨 " + message, [[callback("🏠 Главное меню", "back_to_menu")], [callback("📞 Позвонить в клинику", "clinic_phone")]])
 
 
-def begin_support(user_id: int) -> None:
-    session_for(user_id)["step"] = "waiting_support"
-    send_message(user_id, "💬 Напишите одним сообщением ваш вопрос администратору. Для ответа в MAX авторизация не требуется.", [[callback("⬅️ Отмена", "back_to_menu")]])
+def begin_support(user_id: int, promotion_title: str = "") -> None:
+    user = session_for(user_id)
+    user["step"] = "waiting_support"
+    user["support_subject"] = f"Вопрос по акции: {promotion_title}" if promotion_title else "Вопрос пациента"
+    prompt = f"\n\nАкция: {promotion_title}" if promotion_title else ""
+    send_message(user_id, "💬 Напишите одним сообщением ваш вопрос администратору." + prompt + " Для ответа в MAX авторизация не требуется.", [[callback("⬅️ Отмена", "back_to_menu")]])
 
 
 def handle_text(user_id: int, text: str) -> None:
@@ -923,7 +928,8 @@ def handle_text(user_id: int, text: str) -> None:
         return
     if state == "waiting_support":
         user["step"] = None
-        result = create_support_request(user_id, "Вопрос пациента", text, priority=1)
+        subject = user.pop("support_subject", "Вопрос пациента")
+        result = create_support_request(user_id, subject, text, priority=1)
         task_id = result.get("result", {}).get("task", {}).get("id")
         lead_id = lead_id_from(result)
         msg = f"Обращение передано администратору. Номер задачи #{task_id}." if task_id else (f"Обращение передано в CRM. Номер обращения #{lead_id}." if lead_id else f"Передачу не удалось подтвердить. Позвоните: {CLINIC_PHONE}.")
@@ -1022,6 +1028,9 @@ def dispatch_callback(user_id: int, data: str) -> None:
         show_promotion_detail(user_id, data.rsplit("_", 1)[1])
     elif data.startswith("promo_book_"):
         start_promotion_booking(user_id, data.rsplit("_", 1)[1])
+    elif data.startswith("promo_question_"):
+        promo = promotion_by_id(data.rsplit("_", 1)[1])
+        begin_support(user_id, promo.get("title", "") if promo else "")
     elif data == "about":
         text = ("🏥 О клинике «Альфа-Дент»\n\nКлиника работает с 2011 года.\n\n"
                 f"Адрес: {CLINIC_ADDRESS}\nГрафик: {CLINIC_HOURS}\nТелефон / WhatsApp: {CLINIC_PHONE}\n"
