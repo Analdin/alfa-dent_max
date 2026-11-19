@@ -58,7 +58,7 @@ CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 эт�
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
 YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
 PROMOTIONS_URL = config.PROMOTIONS_URL.strip()
-PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
+PROMOTIONS_FILE = BASE_DIR.parent / "web" / "assets" / "promotions.json"
 CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 try:
     CLINIC_TZ = ZoneInfo(CLINIC_TIMEZONE_NAME)
@@ -728,7 +728,7 @@ def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) ->
         rows.append(nav)
     if appointment_flow:
         rows.extend([[callback("Пусть врача подберёт администратор", "book_doctor_unknown")], [callback("⬅️ К услугам", "book_change_service")]])
-        txt = "Выберите врача только как пожелание. Связь «услуга → врач» ещё не подтверждена, поэтому администратор проверит, оказывает ли выбранный специалист эту услугу. Можно поручить подбор администратору."
+        txt = "Чтобы записаться к врачу — нажмите на его карточку."
     else:
         rows.extend(miniapp_rows("Карточки врачей в Mini App"))
         rows.append([callback("⬅️ Главное меню", "back_to_menu")])
@@ -824,8 +824,9 @@ def show_promotions(user_id: int) -> None:
         return
     rows = [[callback(f"🎁 {p.get('title','Акция')} · {p.get('price','')}", f"promo_open_{p.get('id')}")] for p in promos]
     rows.extend(miniapp_rows("Открыть акции в Mini App"))
+    rows.append([callback("💬 Уточнить конкретный вопрос по акции", "support")])
     rows.append([callback("⬅️ Главное меню", "back_to_menu")])
-    send_message(user_id, "🎁 Акции и предложения\n\nСписок загружается из файла существующего Mini App. Сроки части предложений в исходной таблице не указаны; перед записью администратор подтвердит актуальность условий.", rows)
+    send_message(user_id, "🎁 Акции и предложения\n\nВыберите предложение, чтобы посмотреть описание, стоимость и условия. Актуальность и применимость условий подтвердит администратор.", rows)
 
 
 def show_promotion_detail(user_id: int, promo_id: str) -> None:
