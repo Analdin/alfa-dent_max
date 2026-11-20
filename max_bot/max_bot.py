@@ -58,7 +58,7 @@ CLINIC_ADDRESS = "г. Сочи, ул. Северная, 12, корп. 2, 2 эт�
 CLINIC_HOURS = "Ежедневно, 09:00–20:00"
 YANDEX_MAPS_URL = "https://yandex.ru/medicine/clinic/alfa_dent_1617563656"
 PROMOTIONS_URL = config.PROMOTIONS_URL.strip()
-PROMOTIONS_FILE = BASE_DIR.parent / "web" / "assets" / "promotions.json"
+PROMOTIONS_FILE = BASE_DIR / "web" / "assets" / "promotions.json"
 CLINIC_TIMEZONE_NAME = "Europe/Moscow"
 try:
     CLINIC_TZ = ZoneInfo(CLINIC_TIMEZONE_NAME)
@@ -313,7 +313,7 @@ def bitrix_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
     if not BITRIX24_WEBHOOK or BITRIX24_WEBHOOK.startswith("PASTE_NEW_"):
         return {"error": "BITRIX24_WEBHOOK не настроен"}
     try:
-        resp = requests.post(f"{BITRIX24_WEBHOOK}/{method}", json=params, timeout=15)
+        resp = requests.post(f"{BITRIX24_WEBHOOK.rstrip('/')}/{method}", json=params, timeout=15)
         resp.raise_for_status()
         result = resp.json()
         if result.get("error"):
@@ -322,6 +322,126 @@ def bitrix_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("Ошибка Bitrix24: %s", method)
         return {"error": str(exc)}
+
+
+def _money_value(value: Any) -> float:
+    try:
+        return float(str(value or "0").replace(" ", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_rub(value: Any) -> str:
+    amount = _money_value(value)
+    return f"{amount:,.0f} ₽".replace(",", " ") if amount else ""
+
+
+def _format_visit_date(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Дата не указана"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.strftime("%d.%m.%Y")
+    except ValueError:
+        return raw[:10]
+
+
+def _load_client_deals(contact_id: Any) -> list[dict[str, Any]]:
+    """Load CRM deals linked to a Bitrix24 contact; never expose internal IDs to a patient."""
+    if not contact_id:
+        return []
+    select = [
+        "ID", "TITLE", "CONTACT_ID", "OPPORTUNITY", "CURRENCY_ID",
+        "UF_CRM_WORKDATE_INFOCLINICA", "UF_CRM_APPOINTMENT_TIME_INFOCLINICA",
+    ]
+    items: list[dict[str, Any]] = []
+    start = 0
+    for _ in range(10):
+        response = bitrix_call("crm.deal.list", {
+            "filter": {"CONTACT_ID": int(contact_id)},
+            "order": {"DATE_CREATE": "DESC"},
+            "select": select,
+            "start": start,
+        })
+        result = response.get("result", []) if isinstance(response, dict) else []
+        if not isinstance(result, list):
+            logger.warning("Bitrix24 crm.deal.list returned unexpected result for visits")
+            break
+        items.extend(x for x in result if isinstance(x, dict))
+        if len(result) < 50:
+            break
+        start += len(result)
+    return items
+
+
+def _build_visits_text(contact_id: Any) -> str:
+    deals = _load_client_deals(contact_id)
+    if not deals:
+        return "По вашему номеру пока не найдены записи. Если вы считаете, что это ошибка, напишите администратору."
+
+    visits: list[dict[str, Any]] = []
+    orders: list[dict[str, Any]] = []
+    treatment_plans: list[dict[str, Any]] = []
+    for deal in deals:
+        title = str(deal.get("TITLE") or "Приём в клинике").strip()
+        normalized_title = title.casefold()
+        amount = _money_value(deal.get("OPPORTUNITY"))
+        row = {
+            "title": title,
+            "date": _format_visit_date(deal.get("UF_CRM_WORKDATE_INFOCLINICA")),
+            "time": str(deal.get("UF_CRM_APPOINTMENT_TIME_INFOCLINICA") or "").strip(),
+            "amount": amount,
+        }
+        if "план лечения" in normalized_title:
+            treatment_plans.append(row)
+        elif "заказ-наряд" in normalized_title or "заказ наряд" in normalized_title:
+            orders.append(row)
+        elif deal.get("UF_CRM_WORKDATE_INFOCLINICA") or deal.get("UF_CRM_APPOINTMENT_TIME_INFOCLINICA"):
+            visits.append(row)
+
+    visits.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+    orders.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+    treatment_plans.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+
+    lines = ["📅 Мои визиты"]
+    if visits:
+        lines.append("\nПосещения")
+        for row in visits[:20]:
+            lines.append(f"\n📅 {row['date']}" + (f" · {row['time']}" if row["time"] else ""))
+            lines.append(f"{row['title']}")
+            if row["amount"] > 0:
+                lines.append(f"Стоимость: {_format_rub(row['amount'])}")
+    else:
+        lines.append("\nЗаписей с датой и временем пока не найдено.")
+    visit_total = sum(x["amount"] for x in visits)
+    if visit_total > 0:
+        lines.append(f"\nСумма по посещениям: {_format_rub(visit_total)}")
+
+    if orders:
+        order_total = sum(x["amount"] for x in orders)
+        lines.append("\nЗаказ-наряды")
+        for row in orders[:10]:
+            lines.append(f"\n📄 {row['date']}" + (f" · {row['time']}" if row["time"] else ""))
+            lines.append(f"{row['title']}")
+            if row["amount"] > 0:
+                lines.append(f"Сумма заказ-наряда: {_format_rub(row['amount'])}")
+        if order_total > 0:
+            lines.append(f"\nИтого по заказ-нарядам: {_format_rub(order_total)}")
+            lines.append("Это суммы сделок в CRM, не подтверждение фактической оплаты.")
+
+    if treatment_plans:
+        plan_total = sum(x["amount"] for x in treatment_plans)
+        lines.append("\nПланы лечения")
+        for row in treatment_plans[:5]:
+            lines.append(f"\n📋 {row['date']} · {row['title']}")
+            if row["amount"] > 0:
+                lines.append(f"Стоимость плана: {_format_rub(row['amount'])}")
+        if plan_total > 0:
+            lines.append("Стоимость плана лечения не означает, что эта сумма оплачена.")
+
+    lines.append("\nДля уточнения начислений или оплат напишите администратору.")
+    return "\n".join(lines)
 
 
 def lead_id_from(result: dict[str, Any]) -> Optional[str]:
@@ -646,6 +766,8 @@ def process_phone(user_id: int, text: str) -> None:
     client = find_client_in_bitrix(user["phone"])
     if client.get("found"):
         user["bitrix_id"] = client.get("id"); user["bitrix_type"] = client.get("type")
+        if client.get("type") == "CONTACT":
+            user["bitrix_contact_id"] = client.get("id")
         user["name"] = client.get("name") or user.get("name") or "Пациент"
     try:
         response=requests.post(f"{AUTH_API_URL}/api/auth/register",json={"platform":"max","phone":user["phone"],"name":user.get("name","")},headers={"X-Internal-Auth":AUTH_API_SECRET},timeout=10)
@@ -678,9 +800,25 @@ def process_password(user_id: int, text: str) -> None:
 
 
 def show_my_visits(user_id: int) -> None:
-    send_message(user_id, "📅 Мои визиты\n\nРеальные визиты хранятся в медицинской информационной системе «Инфоклиника». Её API пока не подключено; данные CRM Bitrix24 не являются подтверждёнными визитами. Я не буду показывать фиктивные записи или имитировать подтверждение, перенос и отмену. Можно отправить запрос администратору.", [
-        [callback("📨 Запросить информацию о визитах", "visits_request")],
-        *miniapp_rows(),
+    user = session_for(user_id)
+    contact_id = user.get("bitrix_contact_id") or (
+        user.get("bitrix_id") if str(user.get("bitrix_type", "")).upper() == "CONTACT" else None
+    )
+    if not contact_id and user.get("phone"):
+        client = find_client_in_bitrix(user["phone"])
+        if client.get("found") and str(client.get("type", "")).upper() == "CONTACT":
+            contact_id = client.get("id")
+            user["bitrix_contact_id"] = contact_id
+            persist_session(user_id)
+    if not contact_id:
+        text = "📅 Мои визиты\n\nНе удалось связать ваш профиль с карточкой пациента в CRM. Проверьте номер телефона или обратитесь к администратору."
+    else:
+        text = _build_visits_text(contact_id)
+        # MAX text messages do not interpret HTML markup.
+        text = re.sub(r"</?b>|</?i>", "", text)
+    send_message(user_id, text, [
+        [callback("🔄 Обновить", "my_visits")],
+        [callback("💬 Написать администратору", "support")],
         [callback("⬅️ Главное меню", "back_to_menu")],
     ])
 
@@ -728,7 +866,7 @@ def show_doctors(user_id: int, page: int = 0, appointment_flow: bool = False) ->
         rows.append(nav)
     if appointment_flow:
         rows.extend([[callback("Пусть врача подберёт администратор", "book_doctor_unknown")], [callback("⬅️ К услугам", "book_change_service")]])
-        txt = "Выберите врача\n\nЧтобы записаться к врачу — нажмите на его карточку."
+        txt = "Выберите врача только как пожелание. Связь «услуга → врач» ещё не подтверждена, поэтому администратор проверит, оказывает ли выбранный специалист эту услугу. Можно поручить подбор администратору."
     else:
         rows.extend(miniapp_rows("Карточки врачей в Mini App"))
         rows.append([callback("⬅️ Главное меню", "back_to_menu")])
@@ -824,9 +962,8 @@ def show_promotions(user_id: int) -> None:
         return
     rows = [[callback(f"🎁 {p.get('title','Акция')} · {p.get('price','')}", f"promo_open_{p.get('id')}")] for p in promos]
     rows.extend(miniapp_rows("Открыть акции в Mini App"))
-    rows.append([callback("💬 Уточнить конкретный вопрос по акции", "support")])
     rows.append([callback("⬅️ Главное меню", "back_to_menu")])
-    send_message(user_id, "🎁 Акции и предложения\n\nВыберите предложение, чтобы посмотреть описание, стоимость и условия. Актуальность условий подтвердит администратор.", rows)
+    send_message(user_id, "🎁 Акции и предложения\n\nСписок загружается из файла существующего Mini App. Сроки части предложений в исходной таблице не указаны; перед записью администратор подтвердит актуальность условий.", rows)
 
 
 def show_promotion_detail(user_id: int, promo_id: str) -> None:
@@ -839,7 +976,6 @@ def show_promotion_detail(user_id: int, promo_id: str) -> None:
             f"{promo.get('summary','')}\n\nУсловия и ограничения: {promo.get('conditions','Уточнить у администратора')}\n\n"
             f"Врачи: {doctors}\n\nАктуальность и применимость предложения подтвердит администратор.")
     rows = [[callback("🦷 Записаться по акции", f"promo_book_{promo.get('id')}")],
-            [callback("💬 Уточнить вопрос по этой акции", f"promo_question_{promo.get('id')}")],
             [callback("⬅️ К акциям", "promo")]]
     if str(promo.get("more_url", "")).startswith("https://"):
         rows.insert(1, [link_button("Подробнее об акции", promo["more_url"])])
@@ -879,12 +1015,9 @@ def submit_emergency(user_id: int) -> None:
     send_message(user_id, "🚨 " + message, [[callback("🏠 Главное меню", "back_to_menu")], [callback("📞 Позвонить в клинику", "clinic_phone")]])
 
 
-def begin_support(user_id: int, promotion_title: str = "") -> None:
-    user = session_for(user_id)
-    user["step"] = "waiting_support"
-    user["support_subject"] = f"Вопрос по акции: {promotion_title}" if promotion_title else "Вопрос пациента"
-    prompt = f"\n\nАкция: {promotion_title}" if promotion_title else ""
-    send_message(user_id, "💬 Напишите одним сообщением ваш вопрос администратору." + prompt + " Для ответа в MAX авторизация не требуется.", [[callback("⬅️ Отмена", "back_to_menu")]])
+def begin_support(user_id: int) -> None:
+    session_for(user_id)["step"] = "waiting_support"
+    send_message(user_id, "💬 Напишите одним сообщением ваш вопрос администратору. Для ответа в MAX авторизация не требуется.", [[callback("⬅️ Отмена", "back_to_menu")]])
 
 
 def handle_text(user_id: int, text: str) -> None:
@@ -928,8 +1061,7 @@ def handle_text(user_id: int, text: str) -> None:
         return
     if state == "waiting_support":
         user["step"] = None
-        subject = user.pop("support_subject", "Вопрос пациента")
-        result = create_support_request(user_id, subject, text, priority=1)
+        result = create_support_request(user_id, "Вопрос пациента", text, priority=1)
         task_id = result.get("result", {}).get("task", {}).get("id")
         lead_id = lead_id_from(result)
         msg = f"Обращение передано администратору. Номер задачи #{task_id}." if task_id else (f"Обращение передано в CRM. Номер обращения #{lead_id}." if lead_id else f"Передачу не удалось подтвердить. Позвоните: {CLINIC_PHONE}.")
@@ -1028,9 +1160,6 @@ def dispatch_callback(user_id: int, data: str) -> None:
         show_promotion_detail(user_id, data.rsplit("_", 1)[1])
     elif data.startswith("promo_book_"):
         start_promotion_booking(user_id, data.rsplit("_", 1)[1])
-    elif data.startswith("promo_question_"):
-        promo = promotion_by_id(data.rsplit("_", 1)[1])
-        begin_support(user_id, promo.get("title", "") if promo else "")
     elif data == "about":
         text = ("🏥 О клинике «Альфа-Дент»\n\nКлиника работает с 2011 года.\n\n"
                 f"Адрес: {CLINIC_ADDRESS}\nГрафик: {CLINIC_HOURS}\nТелефон / WhatsApp: {CLINIC_PHONE}\n"
